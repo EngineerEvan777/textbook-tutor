@@ -429,209 +429,424 @@ def home():
 <html>
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Textbook Tutor</title>
   <style>
-    :root {
-      --bg: #f6f7fb;
-      --panel: #ffffff;
-      --border: #d9d9e3;
-      --text: #111;
-      --muted: #666;
-      --user: #e9f0ff;
-      --assistant: #ffffff;
+    :root{
+      --bg:#f6f7fb;
+      --panel:#ffffff;
+      --border:#d9d9e3;
+      --text:#111;
+      --muted:#667085;
+      --accent:#2563eb;
+      --accent2:#1d4ed8;
+      --ok:#16a34a;
+      --warn:#f59e0b;
+      --bad:#dc2626;
+
+      --shadow: 0 10px 25px rgba(17,24,39,.08);
+      --radius: 16px;
     }
 
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Arial, sans-serif;
-      color: var(--text);
-      background: var(--bg);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
+    *{box-sizing:border-box;}
+    html,body{height:100%;}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      color:var(--text);
+      background:linear-gradient(180deg,#f7f8ff 0%, var(--bg) 40%, #f4f6fb 100%);
     }
 
-    .container {
-      max-width: 980px;
-      width: 100%;
+    .wrap{
+      max-width: 1020px;
       margin: 0 auto;
-      padding: 18px 18px 0 18px;
-      display: flex;
-      flex-direction: column;
-      flex: 1;
-      min-height: 0;
+      padding: 22px 18px 40px;
     }
 
-    h2 { margin: 6px 0 8px; }
-    hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
-    .small { color: var(--muted); font-size: 13px; }
-    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    input, select, button, textarea { font-size: 14px; }
-    input[type="text"] { padding: 6px 8px; }
-    button { padding: 6px 10px; cursor: pointer; }
-
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 14px;
+    /* Header */
+    .topbar{
+      display:flex;
+      gap:12px;
+      align-items:center;
+      justify-content:space-between;
+      margin-bottom:14px;
+    }
+    .brand{
+      display:flex;
+      gap:12px;
+      align-items:center;
+    }
+    .logo{
+      width:38px;height:38px;
+      border-radius:12px;
+      background: radial-gradient(circle at 30% 30%, #60a5fa 0%, #2563eb 45%, #1e40af 100%);
+      box-shadow: var(--shadow);
+    }
+    .brand h1{
+      font-size: 22px;
+      margin:0;
+      letter-spacing:.2px;
+    }
+    .brand .sub{
+      margin:2px 0 0;
+      color:var(--muted);
+      font-size:13px;
     }
 
-    /* Collapsible setup panel */
-    details.panel summary {
-      list-style: none;
-      cursor: pointer;
-      font-weight: bold;
-      font-size: 18px;
+    /* Cards / sections */
+    .card{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
     }
-    details.panel summary::-webkit-details-marker { display: none; }
-    details.panel summary:before { content: "▾ "; }
-    details.panel[open] summary:before { content: "▴ "; }
+    .card.pad{ padding: 16px; }
 
-    /* Chat layout */
-    .chatWrap {
-      display: flex;
-      flex-direction: column;
-      flex: 1;
-      min-height: 0;
-      margin-top: 14px;
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
     }
 
-    #chat {
-      flex: 1;
-      min-height: 0;
-      overflow-y: auto;
-      padding: 14px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
+    .row{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      align-items:center;
     }
 
-    .msg {
-      max-width: 860px;
-      margin: 10px 0;
+    label{
+      color:var(--muted);
+      font-size: 13px;
+    }
+
+    input, select, textarea, button{
+      font: inherit;
+      font-size: 14px;
+    }
+
+    input[type="text"], select{
       padding: 10px 12px;
-      border: 1px solid var(--border);
+      border:1px solid var(--border);
+      border-radius: 12px;
+      outline:none;
+      background:#fff;
+      min-height: 40px;
+    }
+    input[type="text"]:focus, select:focus, textarea:focus{
+      border-color: rgba(37,99,235,.5);
+      box-shadow: 0 0 0 4px rgba(37,99,235,.12);
+    }
+
+    textarea{
+      width:100%;
+      padding: 12px;
+      border:1px solid var(--border);
+      border-radius: 14px;
+      outline:none;
+      resize: none;
+      min-height: 56px;
+      max-height: 220px;
+    }
+
+    button{
+      border:1px solid rgba(37,99,235,.25);
+      background: linear-gradient(180deg, #2f6cf6 0%, var(--accent) 100%);
+      color:#fff;
+      padding: 10px 14px;
+      border-radius: 12px;
+      cursor:pointer;
+      min-height: 40px;
+      font-weight: 600;
+      letter-spacing:.2px;
+    }
+    button:hover{ background: linear-gradient(180deg, #2b66ee 0%, var(--accent2) 100%); }
+    button.secondary{
+      background:#fff;
+      color:var(--text);
+      border:1px solid var(--border);
+      font-weight:600;
+    }
+    button.secondary:hover{ background:#f9fafb; }
+    button:disabled{
+      opacity:.55;
+      cursor:not-allowed;
+    }
+
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 8px 10px;
+      border:1px solid var(--border);
+      border-radius: 999px;
+      background:#fff;
+      color:var(--muted);
+      font-size: 12px;
+      white-space:nowrap;
+    }
+    .dot{ width:8px;height:8px;border-radius:999px;background:var(--warn); }
+    .dot.ok{ background: var(--ok); }
+    .dot.bad{ background: var(--bad); }
+
+    details summary{
+      list-style:none;
+      cursor:pointer;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      user-select:none;
+      font-weight: 800;
+      font-size: 16px;
+      padding: 14px 16px;
+    }
+    details summary::-webkit-details-marker{display:none;}
+    details .content{
+      border-top:1px solid var(--border);
+      padding: 14px 16px 16px;
+    }
+
+    /* Upload status line */
+    .statusLine{
+      display:flex;
+      gap:10px;
+      align-items:center;
+      color:var(--muted);
+      font-size: 13px;
+      margin-top:10px;
+    }
+    .spinner{
+      width:14px;height:14px;
+      border-radius:50%;
+      border:2px solid rgba(37,99,235,.2);
+      border-top-color: rgba(37,99,235,.9);
+      animation: spin 0.9s linear infinite;
+      display:none;
+    }
+    @keyframes spin{ to{ transform: rotate(360deg);} }
+
+    /* Chat */
+    .chatTitle{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      padding: 14px 16px;
+      border-bottom:1px solid var(--border);
+    }
+    .chatTitle h2{ margin:0; font-size:16px; }
+    .chat{
+      padding: 14px 14px 6px;
+      max-height: 58vh;
+      overflow:auto;
+    }
+
+    .msg{
+      max-width: 900px;
+      margin: 10px 0;
+      padding: 12px 12px;
+      border:1px solid var(--border);
       border-radius: 14px;
       white-space: pre-wrap;
+      line-height: 1.42;
+      background:#fff;
+    }
+    .msg.user{
+      margin-left:auto;
+      background: #e9f0ff;
+      border-color: rgba(37,99,235,.18);
+    }
+    .msg.assistant{
+      margin-right:auto;
+    }
+    .meta{
+      margin: 6px 2px 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .inputBar{
+      display:flex;
+      gap:10px;
+      align-items:flex-end;
+      padding: 12px 14px 14px;
+      border-top:1px solid var(--border);
+    }
+    .kbdHelp{
+      color: var(--muted);
+      font-size: 12px;
+      padding: 0 16px 14px;
+    }
+
+    /* Toast */
+    .toast{
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      background: #111827;
+      color: #fff;
+      padding: 12px 14px;
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      max-width: 420px;
+      display:none;
+      z-index: 9999;
+      font-size: 13px;
       line-height: 1.35;
     }
-    .msg.user { background: var(--user); margin-left: auto; }
-    .msg.assistant { background: var(--assistant); margin-right: auto; }
+    .toast.ok{ background: #0f3d1f; }
+    .toast.bad{ background: #4c1010; }
+    .toast .tTitle{ font-weight:800; margin-bottom:4px; }
+    .muted{ color: var(--muted); font-size: 13px; }
 
-    .metaLine {
-      font-size: 12px;
-      color: var(--muted);
-      margin: 6px 0 0 4px;
-    }
-
-    /* Pinned input bar */
-    .inputBar {
-      margin-top: 10px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px;
-      display: flex;
-      gap: 10px;
-      align-items: flex-end;
-    }
-
-    #q {
-      flex: 1;
-      resize: none;
-      min-height: 44px;
-      max-height: 180px;
-      padding: 10px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      outline: none;
-    }
-
-    #askBtn { min-width: 90px; height: 44px; }
-
-    .disabled {
-      opacity: 0.6;
-      pointer-events: none;
-    }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
   </style>
 </head>
+
 <body>
-  <div class="container">
-    <h2>Textbook Office-Hours Tutor</h2>
-    <div class="small">Upload a PDF, pick the book, ask questions, and you’ll get answers with citations.</div>
-
-    <details class="panel" id="setupPanel" open>
-      <summary>
-        Setup (Upload / Book / Session)
-        <span class="small" style="font-weight:normal;"> — click to expand/collapse</span>
-      </summary>
-
-      <div style="margin-top:12px;">
-        <h3 style="margin:0 0 10px;">1) Upload textbook (PDF)</h3>
-        <div class="row">
-          <input type="file" id="pdf" accept="application/pdf"/>
-          <input type="text" id="title" placeholder="Optional book title" style="min-width:260px;"/>
-          <button onclick="upload()">Upload</button>
-        </div>
-        <div id="uploadStatus" class="small" style="margin-top:8px;"></div>
-
-        <hr/>
-
-        <h3 style="margin:0 0 10px;">2) Ask a question</h3>
-        <div class="row">
-          <label>Book:</label>
-          <select id="bookSelect"></select>
-
-          <label style="margin-left:8px;">Session:</label>
-          <input id="sessionId" style="width: 320px;" />
-          <button onclick="newSession()">New session</button>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <button onclick="refreshBooks()">Refresh books</button>
-          <button onclick="resetSession()">Reset session</button>
-        </div>
-
-        <div class="small" style="margin-top:10px;">
-          Tip: “Session” keeps a conversation thread. Share one session ID with a student for a single chat.
-
-          <div class="small" id="usageLine" style="margin-top:8px;">Usage: (loading...)</div>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>Textbook Office-Hours Tutor</h1>
+          <div class="sub">Upload a PDF, pick the book, ask questions — answers include citations and page numbers.</div>
         </div>
       </div>
-    </details>
-
-    <div class="chatWrap">
-      <h3 style="margin:14px 0 8px;">Chat</h3>
-      <div id="chat"></div>
-
-      <div class="inputBar">
-        <textarea id="q" placeholder="Ask anything like office hours..."></textarea>
-        <button id="askBtn" onclick="ask()">Ask</button>
+      <div class="pill" id="servicePill">
+        <span class="dot" id="svcDot"></span>
+        <span id="svcText">Ready</span>
       </div>
+    </div>
 
-      <div class="small" style="margin:8px 0 14px;">
-        Press Enter to send • Shift+Enter for a new line
+    <div class="grid">
+      <details class="card" id="setupPanel" open>
+        <summary>
+          <span>Setup (Upload / Book / Session)</span>
+          <span class="muted">click to expand/collapse</span>
+        </summary>
+
+        <div class="content">
+          <div class="card pad" style="box-shadow:none;">
+            <div style="font-weight:800; margin-bottom:10px;">1) Upload textbook (PDF)</div>
+
+            <div class="row">
+              <input type="file" id="pdf" accept="application/pdf" />
+              <input type="text" id="title" placeholder="Optional book title" style="min-width:260px; flex:1;" />
+              <button id="uploadBtn" onclick="upload()">Upload</button>
+            </div>
+
+            <div class="statusLine">
+              <div class="spinner" id="upSpin"></div>
+              <div id="uploadStatus">No upload in progress.</div>
+              <div class="muted" id="uploadTimer" style="margin-left:auto;"></div>
+            </div>
+
+            <div class="muted" style="margin-top:10px;">
+              Tip: Large PDFs can take a bit to chunk + embed. If you’re on Render Free, keep the book under ~80MB.
+            </div>
+          </div>
+
+          <div style="height:12px;"></div>
+
+          <div class="card pad" style="box-shadow:none;">
+            <div style="font-weight:800; margin-bottom:10px;">2) Ask a question</div>
+
+            <div class="row">
+              <label>Book</label>
+              <select id="bookSelect" style="min-width: 320px;"></select>
+
+              <label style="margin-left:6px;">Session</label>
+              <input id="sessionId" class="mono" style="width: 360px;" />
+
+              <button class="secondary" onclick="newSession()">New session</button>
+            </div>
+
+            <div class="row" style="margin-top:10px;">
+              <button class="secondary" id="refreshBtn" onclick="refreshBooks()">Refresh books</button>
+              <button class="secondary" onclick="resetSession()">Reset session</button>
+
+              <div class="muted" id="usageLine" style="margin-left:auto;">Usage: (loading...)</div>
+            </div>
+
+            <div class="muted" style="margin-top:10px;">
+              “Session” keeps a conversation thread. Share one session ID with a student for a single chat.
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="chatTitle">
+          <h2>Chat</h2>
+          <div class="pill" id="chatPill">
+            <span class="dot ok" id="chatDot"></span>
+            <span id="chatText">Idle</span>
+          </div>
+        </div>
+
+        <div id="chat" class="chat"></div>
+
+        <div class="inputBar">
+          <textarea id="q" placeholder="Ask anything like office hours..."></textarea>
+          <button id="askBtn" onclick="ask()">Ask</button>
+        </div>
+
+        <div class="kbdHelp">Press Enter to send • Shift+Enter for a new line</div>
       </div>
     </div>
   </div>
 
+  <div class="toast" id="toast">
+    <div class="tTitle" id="toastTitle"></div>
+    <div id="toastBody"></div>
+  </div>
+
 <script>
+/* -------------------------
+   Utilities / state
+-------------------------- */
 function uuidv4() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
     return v.toString(16);
   });
 }
 
+function $(id){ return document.getElementById(id); }
+
+function setServiceState(state, text){
+  const dot = $("svcDot");
+  const t = $("svcText");
+  dot.className = "dot" + (state === "ok" ? " ok" : state === "bad" ? " bad" : "");
+  t.textContent = text || (state === "ok" ? "OK" : state === "bad" ? "Error" : "Working");
+}
+
+function setChatState(state, text){
+  const dot = $("chatDot");
+  const t = $("chatText");
+  dot.className = "dot" + (state === "ok" ? " ok" : state === "bad" ? " bad" : "");
+  t.textContent = text || (state === "ok" ? "Idle" : state === "bad" ? "Error" : "Working");
+}
+
+let toastTimer = null;
+function toast(kind, title, body){
+  const el = $("toast");
+  el.className = "toast" + (kind === "ok" ? " ok" : kind === "bad" ? " bad" : "");
+  $("toastTitle").textContent = title || "";
+  $("toastBody").textContent = body || "";
+  el.style.display = "block";
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 3600);
+}
+
 function scrollChatToBottom() {
-  const chat = document.getElementById('chat');
+  const chat = $("chat");
   chat.scrollTop = chat.scrollHeight;
 }
 
 function addMessage(role, text) {
-  const chat = document.getElementById('chat');
+  const chat = $("chat");
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   div.textContent = text;
@@ -640,174 +855,285 @@ function addMessage(role, text) {
 }
 
 function addMeta(text) {
-  const chat = document.getElementById('chat');
+  const chat = $("chat");
   const div = document.createElement('div');
-  div.className = 'metaLine';
+  div.className = 'meta';
   div.textContent = text;
   chat.appendChild(div);
   scrollChatToBottom();
 }
 
-function collapseSetup() {
-  const d = document.getElementById('setupPanel');
-  if (d) d.open = false;
+function collapseSetupIfReady() {
+  const d = $("setupPanel");
+  const sel = $("bookSelect");
+  if (d && sel && sel.options.length > 0) d.open = false;
 }
 
-async function refreshBooks() {
-  const r = await fetch('/books');
-  const data = await r.json();
-  const sel = document.getElementById('bookSelect');
-  sel.innerHTML = '';
-  (data.books || []).forEach(b => {
-    const opt = document.createElement('option');
-    opt.value = b.book_id;
-    opt.textContent = b.title + ' (' + b.page_total + ' pages)';
-    sel.appendChild(opt);
-  });
+function persist(){
+  localStorage.setItem("tt_session_id", $("sessionId").value.trim());
+  localStorage.setItem("tt_book_id", $("bookSelect").value || "");
+}
 
-  if ((data.books || []).length > 0) {
-    collapseSetup(); // auto-collapse once books exist
+function restore(){
+  const sid = localStorage.getItem("tt_session_id");
+  if (sid) $("sessionId").value = sid;
+
+  // book id is applied after refreshBooks() loads options
+}
+
+/* -------------------------
+   Books / usage
+-------------------------- */
+async function refreshBooks() {
+  const btn = $("refreshBtn");
+  btn.disabled = true;
+  btn.textContent = "Refreshing…";
+  try{
+    setServiceState("work", "Refreshing books");
+    const r = await fetch('/books');
+    const data = await r.json();
+
+    const sel = $("bookSelect");
+    const prev = localStorage.getItem("tt_book_id") || sel.value;
+
+    sel.innerHTML = '';
+    const books = (data.books || []);
+
+    if (books.length === 0){
+      const opt = document.createElement('option');
+      opt.value = "";
+      opt.textContent = "No books yet — upload a PDF above";
+      sel.appendChild(opt);
+      sel.disabled = true;
+      setServiceState("ok", "Ready (no books)");
+      return;
+    }
+
+    sel.disabled = false;
+    books.forEach(b => {
+      const opt = document.createElement('option');
+      opt.value = b.book_id;
+      opt.textContent = `${b.title} (${b.page_total} pages)`;
+      sel.appendChild(opt);
+    });
+
+    // try restore selection
+    if (prev){
+      const match = Array.from(sel.options).find(o => o.value === prev);
+      if (match) sel.value = prev;
+    }
+
+    setServiceState("ok", "Ready");
+    collapseSetupIfReady();
+    persist();
+  } catch(e){
+    setServiceState("bad", "Error");
+    toast("bad", "Couldn’t load books", String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh books";
   }
 }
 
 async function refreshUsage() {
-  const sid = document.getElementById('sessionId').value.trim();
-  const el = document.getElementById('usageLine');
-  if (!el) return;
-
+  const sid = $("sessionId").value.trim();
+  const el = $("usageLine");
   if (!sid) {
     el.textContent = 'Usage: (no session)';
     return;
   }
 
-  const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid));
-  const data = await r.json();
+  try{
+    const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid));
+    const data = await r.json();
 
-  const total = (data.total_tokens || 0).toLocaleString();
-  const input = (data.input_tokens || 0).toLocaleString();
-  const output = (data.output_tokens || 0).toLocaleString();
+    const total = (data.total_tokens || 0).toLocaleString();
+    const input = (data.input_tokens || 0).toLocaleString();
+    const output = (data.output_tokens || 0).toLocaleString();
 
-  el.innerHTML = `
-    <div>Session usage: ${total} tokens processed</div>
-    <div>${input} read from textbook/context • ${output} written in response</div>
-  `;
+    el.textContent = `Session usage: ${total} tokens • ${input} in • ${output} out`;
+  } catch(e){
+    el.textContent = "Usage: (unavailable)";
+  }
 }
 
+/* -------------------------
+   Session controls
+-------------------------- */
 function newSession() {
-  document.getElementById('sessionId').value = uuidv4();
-  document.getElementById('chat').innerHTML = '';
+  $("sessionId").value = uuidv4();
+  $("chat").innerHTML = '';
+  persist();
   refreshUsage();
+  toast("ok", "New session created", "This session ID will keep your chat thread.");
 }
 
 async function resetSession() {
-  const sid = document.getElementById('sessionId').value.trim();
+  const sid = $("sessionId").value.trim();
   if (!sid) return;
-  await fetch('/session/reset', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({session_id: sid})
-  });
-  document.getElementById('chat').innerHTML = '';
-  refreshUsage();
+  try{
+    await fetch('/session/reset', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: sid})
+    });
+    $("chat").innerHTML = '';
+    refreshUsage();
+    toast("ok", "Session reset", "Conversation memory cleared for this session.");
+  } catch(e){
+    toast("bad", "Couldn’t reset session", String(e));
+  }
+}
+
+/* -------------------------
+   Upload
+-------------------------- */
+let uploadT0 = null;
+let uploadTick = null;
+
+function startUploadTimer(){
+  uploadT0 = Date.now();
+  $("uploadTimer").textContent = "0.0s";
+  uploadTick = setInterval(() => {
+    const s = (Date.now() - uploadT0) / 1000;
+    $("uploadTimer").textContent = s.toFixed(1) + "s";
+  }, 100);
+}
+function stopUploadTimer(){
+  if (uploadTick) clearInterval(uploadTick);
+  uploadTick = null;
+}
+
+function setUploadUI(isUploading){
+  $("uploadBtn").disabled = isUploading;
+  $("pdf").disabled = isUploading;
+  $("title").disabled = isUploading;
+  $("upSpin").style.display = isUploading ? "inline-block" : "none";
+  setServiceState(isUploading ? "work" : "ok", isUploading ? "Uploading/indexing" : "Ready");
 }
 
 async function upload() {
-  const f = document.getElementById('pdf').files[0];
-  const title = document.getElementById('title').value.trim();
-  if (!f) return;
+  const f = $("pdf").files[0];
+  const title = $("title").value.trim();
+  if (!f) {
+    toast("bad", "No file selected", "Choose a PDF to upload.");
+    return;
+  }
 
   const fd = new FormData();
   fd.append('file', f);
   if (title) fd.append('title', title);
 
-  document.getElementById('uploadStatus').textContent = 'Uploading and indexing...';
-  const r = await fetch('/upload', {method:'POST', body: fd});
-  const data = await r.json();
+  $("uploadStatus").textContent = 'Uploading and indexing…';
+  setUploadUI(true);
+  startUploadTimer();
 
-  if (!r.ok) {
-    document.getElementById('uploadStatus').textContent = 'Error: ' + (data.detail || 'upload failed');
-    return;
+  try{
+    const r = await fetch('/upload', {method:'POST', body: fd});
+    const data = await r.json();
+
+    if (!r.ok) {
+      $("uploadStatus").textContent = 'Error: ' + (data.detail || 'upload failed');
+      toast("bad", "Upload failed", data.detail || "Unknown error");
+      return;
+    }
+
+    const secs = ((Date.now() - uploadT0) / 1000).toFixed(1);
+    $("uploadStatus").textContent =
+      `Uploaded: ${data.title} • ${data.page_total} pages • ${data.num_chunks} chunks (in ${secs}s)`;
+
+    toast("ok", "Upload complete", `Indexed “${data.title}” in ${secs}s.`);
+    await refreshBooks();
+    collapseSetupIfReady();
+  } catch(e){
+    $("uploadStatus").textContent = "Error: " + String(e);
+    toast("bad", "Upload error", String(e));
+  } finally {
+    stopUploadTimer();
+    setUploadUI(false);
   }
-  document.getElementById('uploadStatus').textContent =
-    'Uploaded: ' + data.title + ' (book_id=' + data.book_id + ')';
-
-  await refreshBooks();
-  collapseSetup(); // collapse after successful upload
 }
 
+/* -------------------------
+   Chat ask
+-------------------------- */
 function setAskingState(isAsking) {
-  const btn = document.getElementById('askBtn');
-  const q = document.getElementById('q');
-  if (isAsking) {
-    btn.classList.add('disabled');
-    btn.textContent = 'Asking...';
-    q.classList.add('disabled');
-  } else {
-    btn.classList.remove('disabled');
-    btn.textContent = 'Ask';
-    q.classList.remove('disabled');
-  }
+  $("askBtn").disabled = isAsking;
+  $("q").disabled = isAsking;
+  setChatState(isAsking ? "work" : "ok", isAsking ? "Asking…" : "Idle");
+  $("askBtn").textContent = isAsking ? "Asking…" : "Ask";
 }
 
 async function ask() {
-  const book_id = document.getElementById('bookSelect').value;
-  const session_id = document.getElementById('sessionId').value.trim();
-  const question = document.getElementById('q').value.trim();
-  if (!book_id || !session_id || !question) return;
+  const book_id = $("bookSelect").value;
+  const session_id = $("sessionId").value.trim();
+  const question = $("q").value.trim();
+
+  if (!book_id) { toast("bad", "Pick a book first", "Upload/select a book before asking."); return; }
+  if (!session_id) { toast("bad", "Missing session ID", "Click “New session” to generate one."); return; }
+  if (!question) return;
+
+  persist();
 
   addMessage('user', question);
-  document.getElementById('q').value = '';
+  $("q").value = '';
   autoGrow();
   setAskingState(true);
 
-  const r = await fetch('/chat', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({book_id, session_id, question})
-  });
+  try{
+    const r = await fetch('/chat', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({book_id, session_id, question})
+    });
+    const data = await r.json();
+    setAskingState(false);
 
-  const data = await r.json();
-  setAskingState(false);
+    if (!r.ok) {
+      addMessage('assistant', '[ERROR] ' + (data.detail || 'chat failed'));
+      toast("bad", "Chat failed", data.detail || "Unknown error");
+      return;
+    }
 
-  if (!r.ok) {
-    addMessage('assistant', '[ERROR] ' + (data.detail || 'chat failed'));
-    return;
+    addMessage('assistant', data.answer || '(no answer)');
+    addMeta('CITATIONS: ' + (data.citations || '(none)'));
+
+    if (data.usage) {
+      const total = (data.usage.total_tokens || 0).toLocaleString();
+      const input = (data.usage.input_tokens || 0).toLocaleString();
+      const output = (data.usage.output_tokens || 0).toLocaleString();
+      addMeta(`Session usage: ${total} tokens • ${input} in • ${output} out`);
+    }
+
+    refreshUsage();
+  } catch(e){
+    setAskingState(false);
+    addMessage('assistant', '[ERROR] ' + String(e));
+    toast("bad", "Network/app error", String(e));
   }
-
-  addMessage('assistant', data.answer || '(no answer)');
-
-  addMeta('CITATIONS: ' + (data.citations || '(none)'));
-
-  if (data.usage) {
-    const total = data.usage.total_tokens.toLocaleString();
-    const input = data.usage.input_tokens.toLocaleString();
-    const output = data.usage.output_tokens.toLocaleString();
-
-    addMeta(`Session usage: ${total} tokens processed`);
-    addMeta(`${input} read from textbook/context • ${output} written in response`);
-  }
-
-  refreshUsage();
 }
 
 function autoGrow() {
-  const ta = document.getElementById('q');
+  const ta = $("q");
   ta.style.height = 'auto';
-  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+  ta.style.height = Math.min(ta.scrollHeight, 220) + 'px';
 }
+$("q").addEventListener('input', autoGrow);
 
-document.getElementById('q').addEventListener('input', autoGrow);
-
-document.getElementById('q').addEventListener('keydown', function(e) {
+$("q").addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     ask();
   }
 });
 
-newSession();
+/* Boot */
+restore();
+if (!$("sessionId").value.trim()) $("sessionId").value = uuidv4();
 refreshBooks();
 refreshUsage();
+setServiceState("ok","Ready");
+setChatState("ok","Idle");
 </script>
 </body>
 </html>
@@ -996,4 +1322,5 @@ def chat(payload: Dict[str, str]):
         "book_id": book_id,
         "usage": usage,
     }
+
 
