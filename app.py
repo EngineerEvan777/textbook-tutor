@@ -18,13 +18,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+
+
 import numpy as np
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import File, UploadFile, HTTPException, Form
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
-
 
 # ----------------------------
 # Logging
@@ -104,7 +105,7 @@ class BookIndex:
     page_total: int
     chunks: List[Chunk]
     index: object          # faiss index
-    embeddings: np.ndarray # shape (n, d), float32
+    embeddings: Optional[np.ndarray] = None
 
 
 BOOKS: Dict[str, BookIndex] = {}
@@ -174,13 +175,14 @@ def save_book_to_disk(book: BookIndex) -> None:
                 "text": c.text,
             }, ensure_ascii=False) + "\n")
 
-    np.save(p["emb"], book.embeddings)
+    if book.embeddings is not None:
+        np.save(p["emb"], book.embeddings)
     faiss.write_index(book.index, str(p["faiss"]))
 
 
 def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
     p = book_paths(book_id, create=False)
-    if not p["meta"].exists() or not p["chunks"].exists() or not p["emb"].exists() or not p["faiss"].exists():
+    if not p["meta"].exists() or not p["chunks"].exists() or not p["faiss"].exists():
         return None
 
     faiss = get_faiss()
@@ -196,8 +198,7 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
                 page_total=int(obj["page_total"]),
                 text=obj["text"],
             ))
-
-    embs = np.load(p["emb"]).astype(np.float32)
+    
     idx = faiss.read_index(str(p["faiss"]))
 
     return BookIndex(
@@ -205,8 +206,7 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
         title=meta["title"],
         page_total=int(meta["page_total"]),
         chunks=chunks,
-        index=idx,
-        embeddings=embs,
+        index=idx
     )
 
 
@@ -389,7 +389,8 @@ Answer:
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
     q = embed_texts_openai([query])
-    if book.embeddings.shape[0] == 0:
+    # FAISS index is the source of truth; embeddings may not be kept in RAM
+    if book.index is None:
         return []
     scores, ids = book.index.search(q, top_k)
     hits: List[Tuple[Chunk, float]] = []
@@ -424,95 +425,394 @@ def favicon():
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-<title>Textbook Tutor</title>
-<style>
-body { font-family: Arial; max-width: 900px; margin: 40px auto; }
-textarea { width: 100%; height: 100px; }
-button { padding: 8px 16px; margin-top: 10px; }
-#answer { margin-top: 20px; padding: 10px; background: #f5f5f5; }
-</style>
+  <meta charset="utf-8" />
+  <title>Textbook Tutor</title>
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --panel: #ffffff;
+      --border: #d9d9e3;
+      --text: #111;
+      --muted: #666;
+      --user: #e9f0ff;
+      --assistant: #ffffff;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .container {
+      max-width: 980px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 18px 18px 0 18px;
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+
+    h2 { margin: 6px 0 8px; }
+    hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+    .small { color: var(--muted); font-size: 13px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input, select, button, textarea { font-size: 14px; }
+    input[type="text"] { padding: 6px 8px; }
+    button { padding: 6px 10px; cursor: pointer; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+
+    /* Collapsible setup panel */
+    details.panel summary {
+      list-style: none;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 18px;
+    }
+    details.panel summary::-webkit-details-marker { display: none; }
+    details.panel summary:before { content: "▾ "; }
+    details.panel[open] summary:before { content: "▴ "; }
+
+    /* Chat layout */
+    .chatWrap {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+      margin-top: 14px;
+    }
+
+    #chat {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 14px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .msg {
+      max-width: 860px;
+      margin: 10px 0;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      white-space: pre-wrap;
+      line-height: 1.35;
+    }
+    .msg.user { background: var(--user); margin-left: auto; }
+    .msg.assistant { background: var(--assistant); margin-right: auto; }
+
+    .metaLine {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 6px 0 0 4px;
+    }
+
+    /* Pinned input bar */
+    .inputBar {
+      margin-top: 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+
+    #q {
+      flex: 1;
+      resize: none;
+      min-height: 44px;
+      max-height: 180px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      outline: none;
+    }
+
+    #askBtn { min-width: 90px; height: 44px; }
+
+    .disabled {
+      opacity: 0.6;
+      pointer-events: none;
+    }
+  </style>
 </head>
-
 <body>
+  <div class="container">
+    <h2>Textbook Office-Hours Tutor</h2>
+    <div class="small">Upload a PDF, pick the book, ask questions, and you’ll get answers with citations.</div>
 
-<h2>📘 Textbook Tutor</h2>
+    <details class="panel" id="setupPanel" open>
+      <summary>
+        Setup (Upload / Book / Session)
+        <span class="small" style="font-weight:normal;"> — click to expand/collapse</span>
+      </summary>
 
-<h3>Upload a textbook</h3>
-<input type="file" id="file"/>
-<button onclick="upload()">Upload</button>
+      <div style="margin-top:12px;">
+        <h3 style="margin:0 0 10px;">1) Upload textbook (PDF)</h3>
+        <div class="row">
+          <input type="file" id="pdf" accept="application/pdf"/>
+          <input type="text" id="title" placeholder="Optional book title" style="min-width:260px;"/>
+          <button onclick="upload()">Upload</button>
+        </div>
+        <div id="uploadStatus" class="small" style="margin-top:8px;"></div>
 
-<h3>Ask a question</h3>
-<textarea id="question" placeholder="Ask about the textbook..."></textarea>
-<br>
-<button onclick="ask()">Ask</button>
+        <hr/>
 
-<div id="answer"></div>
+        <h3 style="margin:0 0 10px;">2) Ask a question</h3>
+        <div class="row">
+          <label>Book:</label>
+          <select id="bookSelect"></select>
+
+          <label style="margin-left:8px;">Session:</label>
+          <input id="sessionId" style="width: 320px;" />
+          <button onclick="newSession()">New session</button>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          <button onclick="refreshBooks()">Refresh books</button>
+          <button onclick="resetSession()">Reset session</button>
+        </div>
+
+        <div class="small" style="margin-top:10px;">
+          Tip: “Session” keeps a conversation thread. Share one session ID with a student for a single chat.
+
+          <div class="small" id="usageLine" style="margin-top:8px;">Usage: (loading...)</div>
+        </div>
+      </div>
+    </details>
+
+    <div class="chatWrap">
+      <h3 style="margin:14px 0 8px;">Chat</h3>
+      <div id="chat"></div>
+
+      <div class="inputBar">
+        <textarea id="q" placeholder="Ask anything like office hours..."></textarea>
+        <button id="askBtn" onclick="ask()">Ask</button>
+      </div>
+
+      <div class="small" style="margin:8px 0 14px;">
+        Press Enter to send • Shift+Enter for a new line
+      </div>
+    </div>
+  </div>
 
 <script>
+function uuidv4() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
 
-let book_id = null;
-let session_id = crypto.randomUUID();
+function scrollChatToBottom() {
+  const chat = document.getElementById('chat');
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addMessage(role, text) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  chat.appendChild(div);
+  scrollChatToBottom();
+}
+
+function addMeta(text) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'metaLine';
+  div.textContent = text;
+  chat.appendChild(div);
+  scrollChatToBottom();
+}
+
+function collapseSetup() {
+  const d = document.getElementById('setupPanel');
+  if (d) d.open = false;
+}
+
+async function refreshBooks() {
+  const r = await fetch('/books');
+  const data = await r.json();
+  const sel = document.getElementById('bookSelect');
+  sel.innerHTML = '';
+  (data.books || []).forEach(b => {
+    const opt = document.createElement('option');
+    opt.value = b.book_id;
+    opt.textContent = b.title + ' (' + b.page_total + ' pages)';
+    sel.appendChild(opt);
+  });
+
+  if ((data.books || []).length > 0) {
+    collapseSetup(); // auto-collapse once books exist
+  }
+}
+
+async function refreshUsage() {
+  const sid = document.getElementById('sessionId').value.trim();
+  const el = document.getElementById('usageLine');
+  if (!el) return;
+
+  if (!sid) {
+    el.textContent = 'Usage: (no session)';
+    return;
+  }
+
+  const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid));
+  const data = await r.json();
+
+  const total = (data.total_tokens || 0).toLocaleString();
+  const input = (data.input_tokens || 0).toLocaleString();
+  const output = (data.output_tokens || 0).toLocaleString();
+
+  el.innerHTML = `
+    <div>Session usage: ${total} tokens processed</div>
+    <div>${input} read from textbook/context • ${output} written in response</div>
+  `;
+}
+
+function newSession() {
+  document.getElementById('sessionId').value = uuidv4();
+  document.getElementById('chat').innerHTML = '';
+  refreshUsage();
+}
+
+async function resetSession() {
+  const sid = document.getElementById('sessionId').value.trim();
+  if (!sid) return;
+  await fetch('/session/reset', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: sid})
+  });
+  document.getElementById('chat').innerHTML = '';
+  refreshUsage();
+}
 
 async function upload() {
+  const f = document.getElementById('pdf').files[0];
+  const title = document.getElementById('title').value.trim();
+  if (!f) return;
 
-    const file = document.getElementById("file").files[0];
-    if (!file) {
-        alert("Please choose a PDF.");
-        return;
-    }
+  const fd = new FormData();
+  fd.append('file', f);
+  if (title) fd.append('title', title);
 
-    const formData = new FormData();
-    formData.append("file", file);
+  document.getElementById('uploadStatus').textContent = 'Uploading and indexing...';
+  const r = await fetch('/upload', {method:'POST', body: fd});
+  const data = await r.json();
 
-    const r = await fetch("/upload", {
-        method: "POST",
-        body: formData
-    });
+  if (!r.ok) {
+    document.getElementById('uploadStatus').textContent = 'Error: ' + (data.detail || 'upload failed');
+    return;
+  }
+  document.getElementById('uploadStatus').textContent =
+    'Uploaded: ' + data.title + ' (book_id=' + data.book_id + ')';
 
-    const data = await r.json();
+  await refreshBooks();
+  collapseSetup(); // collapse after successful upload
+}
 
-    if (data.book_id) {
-        book_id = data.book_id;
-        alert("Uploaded: " + data.title);
-    } else {
-        alert("Upload failed.");
-    }
+function setAskingState(isAsking) {
+  const btn = document.getElementById('askBtn');
+  const q = document.getElementById('q');
+  if (isAsking) {
+    btn.classList.add('disabled');
+    btn.textContent = 'Asking...';
+    q.classList.add('disabled');
+  } else {
+    btn.classList.remove('disabled');
+    btn.textContent = 'Ask';
+    q.classList.remove('disabled');
+  }
 }
 
 async function ask() {
+  const book_id = document.getElementById('bookSelect').value;
+  const session_id = document.getElementById('sessionId').value.trim();
+  const question = document.getElementById('q').value.trim();
+  if (!book_id || !session_id || !question) return;
 
-    if (!book_id) {
-        alert("Upload a book first.");
-        return;
-    }
+  addMessage('user', question);
+  document.getElementById('q').value = '';
+  autoGrow();
+  setAskingState(true);
 
-    const q = document.getElementById("question").value;
+  const r = await fetch('/chat', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({book_id, session_id, question})
+  });
 
-    const r = await fetch("/chat", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-            book_id: book_id,
-            session_id: session_id,
-            question: q
-        })
-    });
+  const data = await r.json();
+  setAskingState(false);
 
-    const data = await r.json();
+  if (!r.ok) {
+    addMessage('assistant', '[ERROR] ' + (data.detail || 'chat failed'));
+    return;
+  }
 
-    document.getElementById("answer").innerHTML =
-        "<b>Answer:</b><br>" + data.answer +
-        "<br><br><b>Citations:</b> " + (data.citations || "None");
+  addMessage('assistant', data.answer || '(no answer)');
+
+  addMeta('CITATIONS: ' + (data.citations || '(none)'));
+
+  if (data.usage) {
+    const total = data.usage.total_tokens.toLocaleString();
+    const input = data.usage.input_tokens.toLocaleString();
+    const output = data.usage.output_tokens.toLocaleString();
+
+    addMeta(`Session usage: ${total} tokens processed`);
+    addMeta(`${input} read from textbook/context • ${output} written in response`);
+  }
+
+  refreshUsage();
 }
 
-</script>
+function autoGrow() {
+  const ta = document.getElementById('q');
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+}
 
+document.getElementById('q').addEventListener('input', autoGrow);
+
+document.getElementById('q').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    ask();
+  }
+});
+
+newSession();
+refreshBooks();
+refreshUsage();
+</script>
 </body>
 </html>
 """
+
 
 
 @app.get("/books")
@@ -530,17 +830,22 @@ def list_books():
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), title: Optional[str] = None):
+async def upload(file: UploadFile = File(...), title: Optional[str] = Form(None)):
+    logger.info("Upload started")
+
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
 
+    logger.info("Reading PDF")
     pdf_bytes = await file.read()
+
     MAX_PDF_MB = 80
     if len(pdf_bytes) > MAX_PDF_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"PDF too large (max {MAX_PDF_MB} MB).")
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file.")
 
+    logger.info("Extracting text")
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         num_pages = len(reader.pages)
@@ -550,6 +855,7 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = None):
     book_id = str(uuid.uuid4())
     book_title = (title or file.filename).strip() or "Untitled PDF"
 
+    logger.info("Splitting into chunks")
     chunks: List[Chunk] = []
     for p in range(num_pages):
         try:
@@ -574,27 +880,32 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = None):
 
     texts = [c.text for c in chunks]
 
-    # Embeddings via OpenAI (fast + low RAM server-side)
+    logger.info("Creating embeddings")
     embs = embed_texts_openai(texts)
+
+    logger.info("Building FAISS index")
     idx = build_faiss_ip_index(embs)
 
-    BOOKS[book_id] = BookIndex(
+    # Create the book object without keeping embeddings in RAM
+    book = BookIndex(
         book_id=book_id,
         title=book_title,
         page_total=num_pages,
         chunks=chunks,
         index=idx,
-        embeddings=embs,
+        embeddings=None,
     )
 
-    save_book_to_disk(BOOKS[book_id])
+    BOOKS[book_id] = book
 
-    return {
-        "book_id": book_id,
-        "title": book_title,
-        "page_total": num_pages,
-        "num_chunks": len(chunks),
-    }
+    # Temporarily attach embeddings so they can be saved to disk
+    book.embeddings = embs
+    save_book_to_disk(book)
+    book.embeddings = None
+
+    logger.info("Upload finished")
+
+    return {"book_id": book_id, "title": book_title, "page_total": num_pages, "num_chunks": len(chunks)}
 
 
 @app.post("/session/reset")
