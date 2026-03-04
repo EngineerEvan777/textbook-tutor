@@ -1,29 +1,9 @@
 """
 Textbook Office-Hours Tutor (single-file FastAPI)
 
-What students can do:
-- Upload one or more PDF textbooks
-- Ask questions conversationally ("like office hours")
-- Get immediate answers with citations like: p. 73 of 1062
-- Switch which book they are asking about
-
-Requirements (install once):
-  python -m venv venv
-  # Windows:
-  venv\\Scripts\\activate
-  # macOS/Linux:
-  source venv/bin/activate
-
-pip install fastapi uvicorn pypdf sentence-transformers faiss-cpu numpy python-multipart openai
-
-Set env var:
-  OPENAI_API_KEY=...
-
-Run in terminal:
-    python -m uvicorn app:app --reload
-
-Open:
-  http://127.0.0.1:8000
+Render-friendly version:
+- NO sentence-transformers / torch
+- Uses OpenAI embeddings + FAISS (faiss-cpu)
 """
 
 import os
@@ -39,12 +19,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import faiss
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 
@@ -56,16 +34,11 @@ logger = logging.getLogger("textbook_tutor")
 
 
 # ----------------------------
-# OpenAI client
+# OpenAI client (lazy)
 # ----------------------------
-_client: OpenAI | None = None
-
+_client: Optional[OpenAI] = None
 
 def get_openai_client() -> OpenAI:
-    """
-    Create the OpenAI client lazily (on first use) so the app doesn't crash
-    at import/startup if the key is missing or wrong.
-    """
     global _client
     if _client is not None:
         return _client
@@ -74,18 +47,28 @@ def get_openai_client() -> OpenAI:
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="Server misconfigured: OPENAI_API_KEY is not set. Set it in the terminal and restart the server.",
+            detail="Server misconfigured: OPENAI_API_KEY is not set.",
         )
-
     _client = OpenAI(api_key=api_key)
     return _client
 
 
 # ----------------------------
+# FAISS (lazy import)
+# ----------------------------
+_FAISS = None
+
+def get_faiss():
+    global _FAISS
+    if _FAISS is None:
+        import faiss
+        _FAISS = faiss
+    return _FAISS
+
+
+# ----------------------------
 # Config
 # ----------------------------
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
 DATA_DIR = Path("./data")
 BOOK_DIR = DATA_DIR / "books"
 SESSION_DIR = DATA_DIR / "sessions"
@@ -98,8 +81,9 @@ MAX_CONTEXT_CHARS = 12000
 CHUNK_TARGET_CHARS = 1200
 CHUNK_OVERLAP_CHARS = 200
 
-# Embeddings
-embedder = SentenceTransformer(EMBED_MODEL_NAME)
+# Embeddings (OpenAI)
+EMBED_MODEL_NAME = "text-embedding-3-small"  # small + cheap + good enough
+EMBED_DIM = 1536  # for text-embedding-3-small
 
 
 # ----------------------------
@@ -119,8 +103,8 @@ class BookIndex:
     title: str
     page_total: int
     chunks: List[Chunk]
-    index: faiss.IndexFlatIP
-    embeddings: np.ndarray  # shape (n, d), float32
+    index: object          # faiss index
+    embeddings: np.ndarray # shape (n, d), float32
 
 
 BOOKS: Dict[str, BookIndex] = {}
@@ -131,21 +115,12 @@ SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # session_id -> [{"role": "...",
 # Helpers
 # ----------------------------
 def extract_page_filter(question: str) -> Optional[int]:
-    """
-    Detect patterns like:
-    - 'p. 32'
-    - 'pdf p.32'
-    - 'page 99'
-    Returns the PDF page number if found.
-    """
     q = question.lower()
-
     patterns = [
         r"\bp\.?\s*(\d+)",
         r"\bpage\s*(\d+)",
         r"\bpdf\s*p\.?\s*(\d+)",
     ]
-
     for pat in patterns:
         m = re.search(pat, q)
         if m:
@@ -177,6 +152,7 @@ def book_paths(book_id: str, create: bool = True) -> Dict[str, Path]:
 
 
 def save_book_to_disk(book: BookIndex) -> None:
+    faiss = get_faiss()
     p = book_paths(book.book_id)
 
     meta = {
@@ -204,9 +180,10 @@ def save_book_to_disk(book: BookIndex) -> None:
 
 def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
     p = book_paths(book_id, create=False)
-
     if not p["meta"].exists() or not p["chunks"].exists() or not p["emb"].exists() or not p["faiss"].exists():
         return None
+
+    faiss = get_faiss()
 
     meta = json.loads(p["meta"].read_text(encoding="utf-8"))
     chunks: List[Chunk] = []
@@ -246,10 +223,6 @@ def load_session_from_disk(session_id: str) -> List[Dict[str, str]]:
 
 
 def split_into_chunks(text: str, target_chars: int, overlap_chars: int) -> List[str]:
-    """
-    Chunk text by paragraphs, then merge to target size with overlap.
-    Keeps chunks readable for Q&A.
-    """
     text = clean_text(text)
     if not text:
         return []
@@ -265,11 +238,9 @@ def split_into_chunks(text: str, target_chars: int, overlap_chars: int) -> List[
             if cur:
                 merged.append(cur)
             cur = p
-
     if cur:
         merged.append(cur)
 
-    # Add overlap by character tail
     if overlap_chars > 0 and len(merged) > 1:
         out = []
         prev_tail = ""
@@ -282,24 +253,49 @@ def split_into_chunks(text: str, target_chars: int, overlap_chars: int) -> List[
     return merged
 
 
-def embed_texts(texts: List[str]) -> np.ndarray:
+def embed_texts_openai(texts: List[str]) -> np.ndarray:
+    """
+    OpenAI embeddings, batched.
+    """
     if not texts:
-        return np.zeros((0, 384), dtype=np.float32)
-    embs = embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        return np.zeros((0, EMBED_DIM), dtype=np.float32)
+
+    client = get_openai_client()
+
+    # Keep batches reasonable
+    BATCH = 64
+    all_vecs: List[List[float]] = []
+
+    for i in range(0, len(texts), BATCH):
+        batch = texts[i:i+BATCH]
+        resp = client.embeddings.create(
+            model=EMBED_MODEL_NAME,
+            input=batch,
+        )
+        # resp.data is in the same order as input
+        for item in resp.data:
+            all_vecs.append(item.embedding)
+
+    embs = np.array(all_vecs, dtype=np.float32)
+
+    # Normalize for cosine / inner product
+    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
+    embs = embs / norms
     return embs.astype(np.float32)
 
 
-def build_faiss_ip_index(embs: np.ndarray) -> faiss.IndexFlatIP:
+def build_faiss_ip_index(embs: np.ndarray):
+    faiss = get_faiss()
     d = embs.shape[1]
     idx = faiss.IndexFlatIP(d)
-    idx.add(embs)
+    if embs.shape[0] > 0:
+        idx.add(embs)
     return idx
 
 
-def llm_generate(prompt: str) -> str:
+def llm_generate(prompt: str) -> Tuple[str, Dict[str, int]]:
     """
-    Calls OpenAI without leaking internal errors to the browser.
-    Detailed error info goes only to server logs.
+    Calls OpenAI and returns (answer_text, usage_dict).
     """
     try:
         client = get_openai_client()
@@ -314,38 +310,27 @@ def llm_generate(prompt: str) -> str:
         usage = getattr(resp, "usage", None)
         if usage:
             usage_data = {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "total_tokens": usage.total_tokens,
+                "input_tokens": int(usage.input_tokens or 0),
+                "output_tokens": int(usage.output_tokens or 0),
+                "total_tokens": int(usage.total_tokens or 0),
             }
         else:
-            usage_data = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-            }
+            usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
         return text, usage_data
 
     except HTTPException:
         raise
-
     except Exception as e:
         logger.error("OpenAI call failed: %s", repr(e))
         traceback.print_exc()
         raise HTTPException(
             status_code=502,
-            detail="LLM call failed. Check your OPENAI_API_KEY and see server logs for details.",
+            detail="LLM call failed. Check OPENAI_API_KEY and Render logs.",
         )
 
 
 def format_citations(hits: List[Tuple[Chunk, float]], answer_text: str) -> str:
-    """
-    Return up to 3 unique pages that actually appear in the final answer text.
-    Matches both:
-      - p. X of Y
-      - [p. X of Y]
-    """
     seen = set()
     pages: List[str] = []
     for ch, _ in hits:
@@ -357,11 +342,7 @@ def format_citations(hits: List[Tuple[Chunk, float]], answer_text: str) -> str:
     return ", ".join(pages[:3])
 
 
-def build_prompt(
-    question: str,
-    hits: List[Tuple[Chunk, float]],
-    history: List[Dict[str, str]],
-) -> str:
+def build_prompt(question: str, hits: List[Tuple[Chunk, float]], history: List[Dict[str, str]]) -> str:
     ctx_parts = []
     used = 0
     for ch, _score in hits:
@@ -381,7 +362,6 @@ def build_prompt(
         content = (m.get("content") or "").strip()
         if content:
             convo.append(f"{role.upper()}: {content}")
-
     convo_block = "\n".join(convo) if convo else "(No prior conversation.)"
 
     return f"""
@@ -408,7 +388,7 @@ Answer:
 
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
-    q = embed_texts([query])
+    q = embed_texts_openai([query])
     if book.embeddings.shape[0] == 0:
         return []
     scores, ids = book.index.search(q, top_k)
@@ -428,13 +408,12 @@ app = FastAPI(title="Textbook Office-Hours Tutor")
 
 @app.on_event("startup")
 def load_all_books():
+    # Load any previously indexed books from disk
     for d in BOOK_DIR.iterdir():
-        if not d.is_dir():
-            continue
-        book_id = d.name
-        b = load_book_from_disk(book_id)
-        if b:
-            BOOKS[book_id] = b
+        if d.is_dir():
+            b = load_book_from_disk(d.name)
+            if b:
+                BOOKS[d.name] = b
 
 
 @app.get("/favicon.ico")
@@ -445,390 +424,92 @@ def favicon():
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>Textbook Tutor</title>
-  <style>
-    :root {
-      --bg: #f6f7fb;
-      --panel: #ffffff;
-      --border: #d9d9e3;
-      --text: #111;
-      --muted: #666;
-      --user: #e9f0ff;
-      --assistant: #ffffff;
-    }
-
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Arial, sans-serif;
-      color: var(--text);
-      background: var(--bg);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .container {
-      max-width: 980px;
-      width: 100%;
-      margin: 0 auto;
-      padding: 18px 18px 0 18px;
-      display: flex;
-      flex-direction: column;
-      flex: 1;
-      min-height: 0;
-    }
-
-    h2 { margin: 6px 0 8px; }
-    hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
-    .small { color: var(--muted); font-size: 13px; }
-    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    input, select, button, textarea { font-size: 14px; }
-    input[type="text"] { padding: 6px 8px; }
-    button { padding: 6px 10px; cursor: pointer; }
-
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 14px;
-    }
-
-    /* Collapsible setup panel */
-    details.panel summary {
-      list-style: none;
-      cursor: pointer;
-      font-weight: bold;
-      font-size: 18px;
-    }
-    details.panel summary::-webkit-details-marker { display: none; }
-    details.panel summary:before { content: "▾ "; }
-    details.panel[open] summary:before { content: "▴ "; }
-
-    /* Chat layout */
-    .chatWrap {
-      display: flex;
-      flex-direction: column;
-      flex: 1;
-      min-height: 0;
-      margin-top: 14px;
-    }
-
-    #chat {
-      flex: 1;
-      min-height: 0;
-      overflow-y: auto;
-      padding: 14px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-    }
-
-    .msg {
-      max-width: 860px;
-      margin: 10px 0;
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      white-space: pre-wrap;
-      line-height: 1.35;
-    }
-    .msg.user { background: var(--user); margin-left: auto; }
-    .msg.assistant { background: var(--assistant); margin-right: auto; }
-
-    .metaLine {
-      font-size: 12px;
-      color: var(--muted);
-      margin: 6px 0 0 4px;
-    }
-
-    /* Pinned input bar */
-    .inputBar {
-      margin-top: 10px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 10px;
-      display: flex;
-      gap: 10px;
-      align-items: flex-end;
-    }
-
-    #q {
-      flex: 1;
-      resize: none;
-      min-height: 44px;
-      max-height: 180px;
-      padding: 10px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      outline: none;
-    }
-
-    #askBtn { min-width: 90px; height: 44px; }
-
-    .disabled {
-      opacity: 0.6;
-      pointer-events: none;
-    }
-  </style>
+<title>Textbook Tutor</title>
+<style>
+body { font-family: Arial; max-width: 900px; margin: 40px auto; }
+textarea { width: 100%; height: 100px; }
+button { padding: 8px 16px; margin-top: 10px; }
+#answer { margin-top: 20px; padding: 10px; background: #f5f5f5; }
+</style>
 </head>
+
 <body>
-  <div class="container">
-    <h2>Textbook Office-Hours Tutor</h2>
-    <div class="small">Upload a PDF, pick the book, ask questions, and you’ll get answers with citations.</div>
 
-    <details class="panel" id="setupPanel" open>
-      <summary>
-        Setup (Upload / Book / Session)
-        <span class="small" style="font-weight:normal;"> — click to expand/collapse</span>
-      </summary>
+<h2>📘 Textbook Tutor</h2>
 
-      <div style="margin-top:12px;">
-        <h3 style="margin:0 0 10px;">1) Upload textbook (PDF)</h3>
-        <div class="row">
-          <input type="file" id="pdf" accept="application/pdf"/>
-          <input type="text" id="title" placeholder="Optional book title" style="min-width:260px;"/>
-          <button onclick="upload()">Upload</button>
-        </div>
-        <div id="uploadStatus" class="small" style="margin-top:8px;"></div>
+<h3>Upload a textbook</h3>
+<input type="file" id="file"/>
+<button onclick="upload()">Upload</button>
 
-        <hr/>
+<h3>Ask a question</h3>
+<textarea id="question" placeholder="Ask about the textbook..."></textarea>
+<br>
+<button onclick="ask()">Ask</button>
 
-        <h3 style="margin:0 0 10px;">2) Ask a question</h3>
-        <div class="row">
-          <label>Book:</label>
-          <select id="bookSelect"></select>
-
-          <label style="margin-left:8px;">Session:</label>
-          <input id="sessionId" style="width: 320px;" />
-          <button onclick="newSession()">New session</button>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <button onclick="refreshBooks()">Refresh books</button>
-          <button onclick="resetSession()">Reset session</button>
-        </div>
-
-        <div class="small" style="margin-top:10px;">
-          Tip: “Session” keeps a conversation thread. Share one session ID with a student for a single chat.
-
-          <div class="small" id="usageLine" style="margin-top:8px;">Usage: (loading...)</div>
-        </div>
-      </div>
-    </details>
-
-    <div class="chatWrap">
-      <h3 style="margin:14px 0 8px;">Chat</h3>
-      <div id="chat"></div>
-
-      <div class="inputBar">
-        <textarea id="q" placeholder="Ask anything like office hours..."></textarea>
-        <button id="askBtn" onclick="ask()">Ask</button>
-      </div>
-
-      <div class="small" style="margin:8px 0 14px;">
-        Press Enter to send • Shift+Enter for a new line
-      </div>
-    </div>
-  </div>
+<div id="answer"></div>
 
 <script>
-function uuidv4() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-}
 
-function scrollChatToBottom() {
-  const chat = document.getElementById('chat');
-  chat.scrollTop = chat.scrollHeight;
-}
-
-function addMessage(role, text) {
-  const chat = document.getElementById('chat');
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  div.textContent = text;
-  chat.appendChild(div);
-  scrollChatToBottom();
-}
-
-function addMeta(text) {
-  const chat = document.getElementById('chat');
-  const div = document.createElement('div');
-  div.className = 'metaLine';
-  div.textContent = text;
-  chat.appendChild(div);
-  scrollChatToBottom();
-}
-
-function collapseSetup() {
-  const d = document.getElementById('setupPanel');
-  if (d) d.open = false;
-}
-
-async function refreshBooks() {
-  const r = await fetch('/books');
-  const data = await r.json();
-  const sel = document.getElementById('bookSelect');
-  sel.innerHTML = '';
-  (data.books || []).forEach(b => {
-    const opt = document.createElement('option');
-    opt.value = b.book_id;
-    opt.textContent = b.title + ' (' + b.page_total + ' pages)';
-    sel.appendChild(opt);
-  });
-
-  if ((data.books || []).length > 0) {
-    collapseSetup(); // auto-collapse once books exist
-  }
-}
-
-async function refreshUsage() {
-  const sid = document.getElementById('sessionId').value.trim();
-  const el = document.getElementById('usageLine');
-  if (!el) return;
-
-  if (!sid) {
-    el.textContent = 'Usage: (no session)';
-    return;
-  }
-
-  const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid));
-  const data = await r.json();
-
-  const total = (data.total_tokens || 0).toLocaleString();
-  const input = (data.input_tokens || 0).toLocaleString();
-  const output = (data.output_tokens || 0).toLocaleString();
-
-  el.innerHTML = `
-    <div>Session usage: ${total} tokens processed</div>
-    <div>${input} read from textbook/context • ${output} written in response</div>
-  `;
-}
-
-function newSession() {
-  document.getElementById('sessionId').value = uuidv4();
-  document.getElementById('chat').innerHTML = '';
-  refreshUsage();
-}
-
-async function resetSession() {
-  const sid = document.getElementById('sessionId').value.trim();
-  if (!sid) return;
-  await fetch('/session/reset', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({session_id: sid})
-  });
-  document.getElementById('chat').innerHTML = '';
-  refreshUsage();
-}
+let book_id = null;
+let session_id = crypto.randomUUID();
 
 async function upload() {
-  const f = document.getElementById('pdf').files[0];
-  const title = document.getElementById('title').value.trim();
-  if (!f) return;
 
-  const fd = new FormData();
-  fd.append('file', f);
-  if (title) fd.append('title', title);
+    const file = document.getElementById("file").files[0];
+    if (!file) {
+        alert("Please choose a PDF.");
+        return;
+    }
 
-  document.getElementById('uploadStatus').textContent = 'Uploading and indexing...';
-  const r = await fetch('/upload', {method:'POST', body: fd});
-  const data = await r.json();
+    const formData = new FormData();
+    formData.append("file", file);
 
-  if (!r.ok) {
-    document.getElementById('uploadStatus').textContent = 'Error: ' + (data.detail || 'upload failed');
-    return;
-  }
-  document.getElementById('uploadStatus').textContent =
-    'Uploaded: ' + data.title + ' (book_id=' + data.book_id + ')';
+    const r = await fetch("/upload", {
+        method: "POST",
+        body: formData
+    });
 
-  await refreshBooks();
-  collapseSetup(); // collapse after successful upload
-}
+    const data = await r.json();
 
-function setAskingState(isAsking) {
-  const btn = document.getElementById('askBtn');
-  const q = document.getElementById('q');
-  if (isAsking) {
-    btn.classList.add('disabled');
-    btn.textContent = 'Asking...';
-    q.classList.add('disabled');
-  } else {
-    btn.classList.remove('disabled');
-    btn.textContent = 'Ask';
-    q.classList.remove('disabled');
-  }
+    if (data.book_id) {
+        book_id = data.book_id;
+        alert("Uploaded: " + data.title);
+    } else {
+        alert("Upload failed.");
+    }
 }
 
 async function ask() {
-  const book_id = document.getElementById('bookSelect').value;
-  const session_id = document.getElementById('sessionId').value.trim();
-  const question = document.getElementById('q').value.trim();
-  if (!book_id || !session_id || !question) return;
 
-  addMessage('user', question);
-  document.getElementById('q').value = '';
-  autoGrow();
-  setAskingState(true);
+    if (!book_id) {
+        alert("Upload a book first.");
+        return;
+    }
 
-  const r = await fetch('/chat', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({book_id, session_id, question})
-  });
+    const q = document.getElementById("question").value;
 
-  const data = await r.json();
-  setAskingState(false);
+    const r = await fetch("/chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+            book_id: book_id,
+            session_id: session_id,
+            question: q
+        })
+    });
 
-  if (!r.ok) {
-    addMessage('assistant', '[ERROR] ' + (data.detail || 'chat failed'));
-    return;
-  }
+    const data = await r.json();
 
-  addMessage('assistant', data.answer || '(no answer)');
-
-  addMeta('CITATIONS: ' + (data.citations || '(none)'));
-
-  if (data.usage) {
-    const total = data.usage.total_tokens.toLocaleString();
-    const input = data.usage.input_tokens.toLocaleString();
-    const output = data.usage.output_tokens.toLocaleString();
-
-    addMeta(`Session usage: ${total} tokens processed`);
-    addMeta(`${input} read from textbook/context • ${output} written in response`);
-  }
-
-  refreshUsage();
+    document.getElementById("answer").innerHTML =
+        "<b>Answer:</b><br>" + data.answer +
+        "<br><br><b>Citations:</b> " + (data.citations || "None");
 }
 
-function autoGrow() {
-  const ta = document.getElementById('q');
-  ta.style.height = 'auto';
-  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
-}
-
-document.getElementById('q').addEventListener('input', autoGrow);
-
-document.getElementById('q').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    ask();
-  }
-});
-
-newSession();
-refreshBooks();
-refreshUsage();
 </script>
+
 </body>
 </html>
 """
@@ -857,7 +538,6 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = None):
     MAX_PDF_MB = 80
     if len(pdf_bytes) > MAX_PDF_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"PDF too large (max {MAX_PDF_MB} MB).")
-
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file.")
 
@@ -893,7 +573,9 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = None):
         raise HTTPException(status_code=400, detail="No extractable text found. If this PDF is scanned, you’ll need OCR.")
 
     texts = [c.text for c in chunks]
-    embs = embed_texts(texts)
+
+    # Embeddings via OpenAI (fast + low RAM server-side)
+    embs = embed_texts_openai(texts)
     idx = build_faiss_ip_index(embs)
 
     BOOKS[book_id] = BookIndex(
@@ -924,7 +606,11 @@ def reset_session(payload: Dict[str, str]):
     path = SESSION_DIR / f"{sid}.json"
     if path.exists():
         path.unlink()
+    usage_path = SESSION_DIR / f"{sid}_usage.json"
+    if usage_path.exists():
+        usage_path.unlink()
     return {"ok": True}
+
 
 @app.get("/session/usage")
 def get_session_usage(session_id: str):
@@ -941,6 +627,7 @@ def get_session_usage(session_id: str):
     except Exception:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+
 @app.post("/chat")
 def chat(payload: Dict[str, str]):
     book_id = (payload.get("book_id") or "").strip()
@@ -948,7 +635,7 @@ def chat(payload: Dict[str, str]):
     question = (payload.get("question") or "").strip()
 
     if len(question) > 4000:
-        raise HTTPException(status_code=400, detail="Question too long (max 4000 chars). Please shorten it.")
+        raise HTTPException(status_code=400, detail="Question too long (max 4000 chars).")
     if len(question) < 2:
         raise HTTPException(status_code=400, detail="Please type a longer question.")
 
@@ -962,18 +649,15 @@ def chat(payload: Dict[str, str]):
     if history is None:
         history = load_session_from_disk(session_id)
 
-    # Step 1: enforce page restriction when requested
     page_filter = extract_page_filter(question)
     if page_filter:
-        filtered_hits = [(c, 1.0) for c in book.chunks if c.page_pdf == page_filter]
-        hits = filtered_hits[:TOP_K]
+        filtered = [(c, 1.0) for c in book.chunks if c.page_pdf == page_filter]
+        hits = filtered[:TOP_K]
     else:
         hits = retrieve(book, question, TOP_K)
 
     prompt = build_prompt(question, hits, history)
     answer, usage = llm_generate(prompt)
-
-    # Step 2: citation precision
     citations = format_citations(hits, answer)
 
     history.append({"role": "user", "content": question})
@@ -982,20 +666,16 @@ def chat(payload: Dict[str, str]):
     save_session_to_disk(session_id, history)
 
     usage_file = SESSION_DIR / f"{session_id}_usage.json"
-
+    current = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     if usage_file.exists():
-        current = json.loads(usage_file.read_text(encoding="utf-8"))
-    else:
-        current = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0
-        }
+        try:
+            current = json.loads(usage_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
 
     current["input_tokens"] += usage["input_tokens"]
     current["output_tokens"] += usage["output_tokens"]
     current["total_tokens"] += usage["total_tokens"]
-
     usage_file.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
     return {
