@@ -723,7 +723,9 @@ def home():
       <details class="card" id="setupPanel" open>
         <summary>
           <span>Setup (Upload / Book / Session)</span>
-          <span class="muted">click to expand/collapse</span>
+          <div class="row" style="margin-left:auto;">
+            <button class="secondary" type="button" onclick="toggleSetup(event)">Hide setup</button>
+          </div>
         </summary>
 
         <div class="content">
@@ -806,6 +808,15 @@ def home():
 /* -------------------------
    Utilities / state
 -------------------------- */
+function toggleSetup(e){
+  e.preventDefault();
+  e.stopPropagation();
+  const d = $("setupPanel");
+  d.open = !d.open;
+  const btn = e.target;
+  btn.textContent = d.open ? "Hide setup" : "Show setup";
+}
+
 function uuidv4() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -1322,5 +1333,6 @@ def chat(payload: Dict[str, str]):
         "book_id": book_id,
         "usage": usage,
     }
+
 
 
