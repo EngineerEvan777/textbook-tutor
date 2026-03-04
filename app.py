@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from fastapi import File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
@@ -996,3 +996,4 @@ def chat(payload: Dict[str, str]):
         "book_id": book_id,
         "usage": usage,
     }
+
