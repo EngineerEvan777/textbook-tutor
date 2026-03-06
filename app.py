@@ -832,6 +832,16 @@ const supabaseClient = supabase.createClient(
   SUPABASE_PUBLISHABLE_KEY
 );
 
+async function showUser() {
+  const { data } = await supabaseClient.auth.getSession()
+
+  if (data.session) {
+    const email = data.session.user.email
+    document.getElementById("loginStatus").textContent =
+      "Logged in as: " + email
+  }
+}
+
 async function sendMagicLink() {
   const email = document.getElementById("loginEmail").value;
   const status = document.getElementById("loginStatus");
@@ -839,7 +849,10 @@ async function sendMagicLink() {
   status.textContent = "Sending login link...";
 
   const { error } = await supabaseClient.auth.signInWithOtp({
-    email: email,
+  email: email,
+  options: {
+      emailRedirectTo: window.location.origin
+    }
   });
 
   if (error) {
@@ -1189,6 +1202,7 @@ refreshBooks();
 refreshUsage();
 setServiceState("ok","Ready");
 setChatState("ok","Idle");
+showUser();
 </script>
 </body>
 </html>
@@ -1370,6 +1384,8 @@ def chat(payload: Dict[str, str]):
     current["total_tokens"] += usage["total_tokens"]
     usage_file.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
+    
+
     return {
         "answer": answer,
         "citations": citations,
@@ -1377,5 +1393,3 @@ def chat(payload: Dict[str, str]):
         "book_id": book_id,
         "usage": usage,
     }
-
-
