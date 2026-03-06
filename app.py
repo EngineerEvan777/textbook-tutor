@@ -726,7 +726,7 @@ def home():
     <div id="loginStatus" style="margin-top:10px;color:#555;"></div>
   </div>
 
-  <div class="wrap">
+  <div id="appContent" class="wrap" style="display:none;">
     <div class="topbar">
       <div class="brand">
         <div class="logo"></div>
@@ -836,13 +836,27 @@ const supabaseClient = supabase.createClient(
   SUPABASE_PUBLISHABLE_KEY
 );
 
+supabaseClient.auth.onAuthStateChange(() => {
+  showUser();
+});
+
 async function showUser() {
   const { data } = await supabaseClient.auth.getSession()
 
   if (data.session) {
     const email = data.session.user.email
+
     document.getElementById("loginStatus").textContent =
       "Logged in as: " + email
+
+    document.getElementById("appContent").style.display = "block"
+
+  } else {
+
+    document.getElementById("loginStatus").textContent =
+      "Please login to use Textbook Tutor."
+
+    document.getElementById("appContent").style.display = "none"
   }
 }
 
@@ -868,8 +882,9 @@ async function sendMagicLink() {
 
 async function logout() {
   await supabaseClient.auth.signOut();
+
   document.getElementById("loginStatus").textContent = "Logged out";
-  location.reload();
+  document.getElementById("appContent").style.display = "none";
 }
 
 async function requireLogin() {
@@ -1157,7 +1172,7 @@ function setAskingState(isAsking) {
 
 async function ask() {
   if (!(await requireLogin())) return;
-  
+
   const book_id = $("bookSelect").value;
   const session_id = $("sessionId").value.trim();
   const question = $("q").value.trim();
