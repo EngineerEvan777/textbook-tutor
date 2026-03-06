@@ -719,6 +719,10 @@ def home():
       Send Magic Login Link
     </button>
 
+    <button onclick="logout()" style="padding:8px 14px;margin-left:10px;">
+      Logout
+    </button>
+
     <div id="loginStatus" style="margin-top:10px;color:#555;"></div>
   </div>
 
@@ -860,6 +864,23 @@ async function sendMagicLink() {
   } else {
     status.textContent = "Check your email for the login link!";
   }
+}
+
+async function logout() {
+  await supabaseClient.auth.signOut();
+  document.getElementById("loginStatus").textContent = "Logged out";
+  location.reload();
+}
+
+async function requireLogin() {
+  const { data } = await supabaseClient.auth.getSession();
+
+  if (!data.session) {
+    alert("Please login first.");
+    return false;
+  }
+
+  return true;
 }
 
 /* -------------------------
@@ -1081,6 +1102,8 @@ function setUploadUI(isUploading){
 }
 
 async function upload() {
+  if (!(await requireLogin())) return;
+  
   const f = $("pdf").files[0];
   const title = $("title").value.trim();
   if (!f) {
@@ -1133,6 +1156,8 @@ function setAskingState(isAsking) {
 }
 
 async function ask() {
+  if (!(await requireLogin())) return;
+  
   const book_id = $("bookSelect").value;
   const session_id = $("sessionId").value.trim();
   const question = $("q").value.trim();
