@@ -428,6 +428,7 @@ def home():
 <!doctype html>
 <html>
 <head>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Textbook Tutor</title>
@@ -704,6 +705,23 @@ def home():
 </head>
 
 <body>
+  <div style="margin:20px 0;padding:15px;border:1px solid #ccc;border-radius:8px;">
+    <h3>Login</h3>
+
+    <input
+      type="email"
+      id="loginEmail"
+      placeholder="Enter your email"
+      style="padding:8px;width:250px;margin-right:10px;"
+    />
+
+    <button onclick="sendMagicLink()" style="padding:8px 14px;">
+      Send Magic Login Link
+    </button>
+
+    <div id="loginStatus" style="margin-top:10px;color:#555;"></div>
+  </div>
+
   <div class="wrap">
     <div class="topbar">
       <div class="brand">
@@ -805,6 +823,32 @@ def home():
   </div>
 
 <script>
+
+const SUPABASE_URL = "https://rdupnwvpngtnivdsxwih.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_hzHLad6qTzjxZ248aDRpLQ_1f88UamG";
+
+const supabaseClient = supabase.createClient(
+  SUPABASE_URL,
+  SUPABASE_PUBLISHABLE_KEY
+);
+
+async function sendMagicLink() {
+  const email = document.getElementById("loginEmail").value;
+  const status = document.getElementById("loginStatus");
+
+  status.textContent = "Sending login link...";
+
+  const { error } = await supabaseClient.auth.signInWithOtp({
+    email: email,
+  });
+
+  if (error) {
+    status.textContent = "Error: " + error.message;
+  } else {
+    status.textContent = "Check your email for the login link!";
+  }
+}
+
 /* -------------------------
    Utilities / state
 -------------------------- */
@@ -1333,6 +1377,5 @@ def chat(payload: Dict[str, str]):
         "book_id": book_id,
         "usage": usage,
     }
-
 
 
