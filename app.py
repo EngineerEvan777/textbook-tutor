@@ -800,45 +800,46 @@ def home():
     <h3>Login or Create Account</h3>
 
     <div style="margin-bottom:10px;color:#555;font-size:14px;line-height:1.4;">
-      New user? Enter your email and password, then click <b>Create Account</b> once.
-      After that, use <b>Login with Password</b> with the same email and password.
-      Already using magic link? Log in first, then click <b>Set Password</b>.
-      You can also use <b>Email Me a Magic Link</b> instead.
+        New user? Enter your email and password, then click <b>Create Account</b>.
+        Already have an account? Use <b>Login with Password</b>.
+        Used magic link before? Log in, then click <b>Set / Update Password</b>.
     </div>
 
-    <input
-      type="email"
-      id="loginEmail"
-      placeholder="Enter your email"
-      style="padding:8px;width:250px;margin-right:10px;"
-    />
+    <div class="row">
+      <input
+        type="email"
+        id="loginEmail"
+        placeholder="Enter your email"
+        style="padding:8px;width:250px;margin-right:10px;"
+      />
 
-    <input
-      type="password"
-      id="loginPassword"
-      placeholder="Enter your password"
-      style="padding:8px;width:220px;margin-right:10px;"
-    />
+      <input
+        type="password"
+        id="loginPassword"
+        placeholder="Enter your password"
+        style="padding:8px;width:220px;margin-right:10px;"
+      />
 
-    <button onclick="loginWithPassword()" style="padding:8px 14px;">
-      Login with Password
-    </button>
+      <button id="loginBtn" onclick="loginWithPassword()" style="padding:8px 14px;">
+        Login with Password
+      </button>
 
-    <button onclick="signUpWithPassword()" style="padding:8px 14px;margin-left:10px;">
-      Create Account
-    </button>
+      <button id="signupBtn" onclick="signUpWithPassword()" style="padding:8px 14px;margin-left:10px;">
+        Create Account
+      </button>
 
-    <button onclick="setPasswordForCurrentUser()" style="padding:8px 14px;margin-left:10px;">
-      Set Password
-    </button>
+      <button id="setPasswordBtn" onclick="setPasswordForCurrentUser()" style="padding:8px 14px;margin-left:10px;">
+        Set / Update Password
+      </button>
 
-    <button onclick="sendMagicLink()" style="padding:8px 14px;margin-left:10px;">
-      Email Me a Magic Link
-    </button>
+      <button id="magicLinkBtn" onclick="sendMagicLink()" style="padding:8px 14px;margin-left:10px;">
+        Email Me a Magic Link
+      </button>
 
-    <button onclick="logout()" style="padding:8px 14px;margin-left:10px;">
-      Logout
-    </button>
+      <button id="logoutBtn" onclick="logout()" style="padding:8px 14px;margin-left:10px;">
+        Logout
+      </button>
+    </div>
 
     <div id="loginStatus" style="margin-top:10px;color:#555;"></div>
   </div>
@@ -1004,10 +1005,35 @@ async function setPasswordForCurrentUser() {
     }
 
     document.getElementById("loginPassword").value = "";
-    status.textContent = "Password set successfully. You can now use Login with Password next time.";
+    status.textContent = "Password set/updated successfully. You can now use Login with Password next time.";
   } catch (err) {
     console.error("setPasswordForCurrentUser failed:", err);
     status.textContent = "Error: " + (err.message || String(err));
+  }
+}
+
+function setAuthUI(isLoggedIn) {
+  const loginBtn = document.getElementById("loginBtn");
+  const signupBtn = document.getElementById("signupBtn");
+  const magicLinkBtn = document.getElementById("magicLinkBtn");
+  const setPasswordBtn = document.getElementById("setPasswordBtn");
+  const logoutBtn = document.getElementById("logoutBtn");
+  const passwordInput = document.getElementById("loginPassword");
+
+  if (isLoggedIn) {
+    if (loginBtn) loginBtn.style.display = "none";
+    if (signupBtn) signupBtn.style.display = "none";
+    if (magicLinkBtn) magicLinkBtn.style.display = "none";
+    if (logoutBtn) logoutBtn.style.display = "inline-block";
+    if (setPasswordBtn) setPasswordBtn.style.display = "inline-block";
+    if (passwordInput) passwordInput.placeholder = "Enter a new password";
+  } else {
+    if (loginBtn) loginBtn.style.display = "inline-block";
+    if (signupBtn) signupBtn.style.display = "inline-block";
+    if (magicLinkBtn) magicLinkBtn.style.display = "inline-block";
+    if (logoutBtn) logoutBtn.style.display = "none";
+    if (setPasswordBtn) setPasswordBtn.style.display = "none";
+    if (passwordInput) passwordInput.placeholder = "Enter your password";
   }
 }
 
@@ -1016,6 +1042,7 @@ async function showUser() {
     document.getElementById("loginStatus").textContent =
       "Login is not initialized. Check Supabase settings.";
     document.getElementById("appContent").style.display = "none";
+    setAuthUI(false);
     return;
   }
 
@@ -1027,7 +1054,9 @@ async function showUser() {
     document.getElementById("loginStatus").textContent =
       "Logged in as: " + email;
 
+    document.getElementById("loginEmail").value = email || "";
     document.getElementById("appContent").style.display = "block";
+    setAuthUI(true);
     refreshBooks();
     refreshUsage();
   } else {
@@ -1035,6 +1064,8 @@ async function showUser() {
       "Please login to use Textbook Tutor.";
 
     document.getElementById("appContent").style.display = "none";
+    setAuthUI(false);
+
     const sel = document.getElementById("bookSelect");
     if (sel) {
       sel.innerHTML = '';
@@ -1161,19 +1192,26 @@ async function signUpWithPassword() {
       const msg = (error.message || "").toLowerCase();
 
       if (msg.includes("user already registered")) {
-        status.textContent = "This email already has an account. Use Login with Password, or log in with a magic link and click Set Password.";
+        status.textContent = "This email already has an account. Use Login with Password, or log in with a magic link and click Set / Update Password.";
       } else {
         status.textContent = "Error: " + error.message;
       }
       return;
     }
 
-    if (data?.user) {
-      status.textContent = "Account created. You can now log in with your email and password.";
-      document.getElementById("loginPassword").value = "";
-    } else {
-      status.textContent = "Sign-up started. Check your email if confirmation is required.";
+    const { error: loginError } = await sb.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (loginError) {
+      status.textContent = "Account created. Now log in with your email and password.";
+      return;
     }
+
+    document.getElementById("loginPassword").value = "";
+    status.textContent = "Account created and logged in successfully.";
+    await showUser();
   } catch (err) {
     console.error("signUpWithPassword failed:", err);
     status.textContent = "Error: " + (err.message || String(err));
@@ -1190,6 +1228,8 @@ async function logout() {
   await sb.auth.signOut();
   document.getElementById("loginStatus").textContent = "Logged out";
   document.getElementById("appContent").style.display = "none";
+  document.getElementById("loginPassword").value = "";
+  setAuthUI(false);
 }
 
 async function requireLogin() {
