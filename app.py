@@ -916,34 +916,47 @@ def home():
 const SUPABASE_URL = __SUPABASE_URL__;
 const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_KEY__;
 
-const sb = supabase.createClient(
-  SUPABASE_URL,
-  SUPABASE_PUBLISHABLE_KEY
-);
+let sb = null;
 
-sb.auth.onAuthStateChange(() => {
-  showUser();
-});
+try {
+  console.log("SUPABASE_URL:", SUPABASE_URL);
+  console.log("SUPABASE_PUBLISHABLE_KEY exists:", !!SUPABASE_PUBLISHABLE_KEY);
+
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+
+  sb.auth.onAuthStateChange(() => {
+    showUser();
+  });
+} catch (err) {
+  console.error("Supabase client init failed:", err);
+  document.getElementById("loginStatus").textContent =
+    "Error initializing login: " + (err.message || String(err));
+}
 
 async function showUser() {
-  const { data } = await sb.auth.getSession()
+  if (!sb) {
+    document.getElementById("loginStatus").textContent =
+      "Login is not initialized. Check Supabase settings.";
+    document.getElementById("appContent").style.display = "none";
+    return;
+  }
+
+  const { data } = await sb.auth.getSession();
 
   if (data.session) {
-    const email = data.session.user.email
+    const email = data.session.user.email;
 
     document.getElementById("loginStatus").textContent =
-      "Logged in as: " + email
+      "Logged in as: " + email;
 
-    document.getElementById("appContent").style.display = "block"
+    document.getElementById("appContent").style.display = "block";
     refreshBooks();
     refreshUsage();
-
   } else {
-
     document.getElementById("loginStatus").textContent =
-      "Please login to use Textbook Tutor."
+      "Please login to use Textbook Tutor.";
 
-    document.getElementById("appContent").style.display = "none"
+    document.getElementById("appContent").style.display = "none";
     const sel = document.getElementById("bookSelect");
     if (sel) {
       sel.innerHTML = '';
@@ -960,6 +973,11 @@ async function sendMagicLink() {
   const email = document.getElementById("loginEmail").value.trim();
   const status = document.getElementById("loginStatus");
 
+  if (!sb) {
+    status.textContent = "Login is not initialized. Check Supabase settings.";
+    return;
+  }
+
   if (!email) {
     status.textContent = "Please enter your email first.";
     return;
@@ -968,10 +986,6 @@ async function sendMagicLink() {
   status.textContent = "Sending login link...";
 
   try {
-    console.log("SUPABASE_URL:", SUPABASE_URL);
-    console.log("SUPABASE_PUBLISHABLE_KEY exists:", !!SUPABASE_PUBLISHABLE_KEY);
-    console.log("Sending OTP to:", email);
-
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("Request timed out after 15 seconds.")), 15000)
     );
@@ -984,8 +998,6 @@ async function sendMagicLink() {
     });
 
     const result = await Promise.race([otpPromise, timeoutPromise]);
-    console.log("OTP result:", result);
-
     const { error } = result;
 
     if (error) {
@@ -1000,15 +1012,24 @@ async function sendMagicLink() {
 }
 
 async function logout() {
-  await sb.auth.signOut();
+  if (!sb) {
+    document.getElementById("loginStatus").textContent =
+      "Login is not initialized. Check Supabase settings.";
+    return;
+  }
 
+  await sb.auth.signOut();
   document.getElementById("loginStatus").textContent = "Logged out";
   document.getElementById("appContent").style.display = "none";
 }
 
 async function requireLogin() {
-  const { data } = await sb.auth.getSession();
+  if (!sb) {
+    alert("Login is not initialized. Check Supabase settings.");
+    return false;
+  }
 
+  const { data } = await sb.auth.getSession();
   if (!data.session) {
     alert("Please login first.");
     return false;
@@ -1018,9 +1039,12 @@ async function requireLogin() {
 }
 
 async function authHeaders(extra = {}) {
+  if (!sb) return { ...extra };
+
   const { data } = await sb.auth.getSession();
   const token = data?.session?.access_token;
   if (!token) return { ...extra };
+
   return {
     Authorization: `Bearer ${token}`,
     ...extra
