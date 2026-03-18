@@ -611,15 +611,21 @@ def home():
       font-size: 14px;
     }
 
-    input[type="text"], select{
+    input[type="text"], input[type="email"], input[type="password"], select{
       padding: 10px 12px;
       border:1px solid var(--border);
       border-radius: 12px;
       outline:none;
       background:#fff;
       min-height: 40px;
+      transition: all 0.15s ease;
     }
-    input[type="text"]:focus, select:focus, textarea:focus{
+
+    input[type="text"]:focus, 
+    input[type="email"]:focus, 
+    input[type="password"]:focus, 
+    select:focus, 
+    textarea:focus{
       border-color: rgba(37,99,235,.5);
       box-shadow: 0 0 0 4px rgba(37,99,235,.12);
     }
@@ -800,8 +806,23 @@ def home():
       style="padding:8px;width:250px;margin-right:10px;"
     />
 
-    <button onclick="sendMagicLink()" style="padding:8px 14px;">
-      Send Magic Login Link
+    <input
+      type="password"
+      id="loginPassword"
+      placeholder="Enter your password"
+      style="padding:8px;width:220px;margin-right:10px;"
+    />
+
+    <button onclick="loginWithPassword()" style="padding:8px 14px;">
+      Login
+    </button>
+
+    <button onclick="signUpWithPassword()" style="padding:8px 14px;margin-left:10px;">
+      Sign Up
+    </button>
+
+    <button onclick="sendMagicLink()" style="padding:8px 14px;margin-left:10px;">
+      Magic Link
     </button>
 
     <button onclick="logout()" style="padding:8px 14px;margin-left:10px;">
@@ -1007,6 +1028,87 @@ async function sendMagicLink() {
     }
   } catch (err) {
     console.error("sendMagicLink failed:", err);
+    status.textContent = "Error: " + (err.message || String(err));
+  }
+}
+
+async function loginWithPassword() {
+  const email = document.getElementById("loginEmail").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  const status = document.getElementById("loginStatus");
+
+  if (!sb) {
+    status.textContent = "Login is not initialized. Check Supabase settings.";
+    return;
+  }
+
+  if (!email || !password) {
+    status.textContent = "Please enter both email and password.";
+    return;
+  }
+
+  status.textContent = "Logging in...";
+
+  try {
+    const { error } = await sb.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (error) {
+      status.textContent = "Error: " + error.message;
+    } else {
+      status.textContent = "Logged in successfully.";
+      document.getElementById("loginPassword").value = "";
+      await showUser();
+    }
+  } catch (err) {
+    console.error("loginWithPassword failed:", err);
+    status.textContent = "Error: " + (err.message || String(err));
+  }
+}
+
+async function signUpWithPassword() {
+  const email = document.getElementById("loginEmail").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  const status = document.getElementById("loginStatus");
+
+  if (!sb) {
+    status.textContent = "Login is not initialized. Check Supabase settings.";
+    return;
+  }
+
+  if (!email || !password) {
+    status.textContent = "Please enter both email and password.";
+    return;
+  }
+
+  if (password.length < 8) {
+    status.textContent = "Password must be at least 8 characters.";
+    return;
+  }
+
+  status.textContent = "Creating account...";
+
+  try {
+    const { data, error } = await sb.auth.signUp({
+      email,
+      password
+    });
+
+    if (error) {
+      status.textContent = "Error: " + error.message;
+      return;
+    }
+
+    if (data?.user) {
+      status.textContent = "Account created. You can now log in with your password.";
+      document.getElementById("loginPassword").value = "";
+    } else {
+      status.textContent = "Sign-up started. Check your email if confirmation is required.";
+    }
+  } catch (err) {
+    console.error("signUpWithPassword failed:", err);
     status.textContent = "Error: " + (err.message || String(err));
   }
 }
