@@ -5,3 +5,4 @@ faiss-cpu
 pypdf
 openai
 python-multipart
+requests
