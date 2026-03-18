@@ -1229,6 +1229,7 @@ async function logout() {
   document.getElementById("loginStatus").textContent = "Logged out";
   document.getElementById("appContent").style.display = "none";
   document.getElementById("loginPassword").value = "";
+  document.getElementById("loginEmail").value = "";
   setAuthUI(false);
 }
 
