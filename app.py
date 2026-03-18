@@ -957,22 +957,45 @@ async function showUser() {
 }
 
 async function sendMagicLink() {
-  const email = document.getElementById("loginEmail").value;
+  const email = document.getElementById("loginEmail").value.trim();
   const status = document.getElementById("loginStatus");
+
+  if (!email) {
+    status.textContent = "Please enter your email first.";
+    return;
+  }
 
   status.textContent = "Sending login link...";
 
-  const { error } = await supabaseClient.auth.signInWithOtp({
-  email: email,
-  options: {
-      emailRedirectTo: window.location.origin
-    }
-  });
+  try {
+    console.log("SUPABASE_URL:", SUPABASE_URL);
+    console.log("SUPABASE_PUBLISHABLE_KEY exists:", !!SUPABASE_PUBLISHABLE_KEY);
+    console.log("Sending OTP to:", email);
 
-  if (error) {
-    status.textContent = "Error: " + error.message;
-  } else {
-    status.textContent = "Check your email for the login link!";
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Request timed out after 15 seconds.")), 15000)
+    );
+
+    const otpPromise = supabaseClient.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: window.location.origin
+      }
+    });
+
+    const result = await Promise.race([otpPromise, timeoutPromise]);
+    console.log("OTP result:", result);
+
+    const { error } = result;
+
+    if (error) {
+      status.textContent = "Error: " + error.message;
+    } else {
+      status.textContent = "Check your email for the login link!";
+    }
+  } catch (err) {
+    console.error("sendMagicLink failed:", err);
+    status.textContent = "Error: " + (err.message || String(err));
   }
 }
 
