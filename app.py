@@ -916,17 +916,17 @@ def home():
 const SUPABASE_URL = __SUPABASE_URL__;
 const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_KEY__;
 
-const supabaseClient = supabase.createClient(
+const sb = supabase.createClient(
   SUPABASE_URL,
   SUPABASE_PUBLISHABLE_KEY
 );
 
-supabaseClient.auth.onAuthStateChange(() => {
+sb.auth.onAuthStateChange(() => {
   showUser();
 });
 
 async function showUser() {
-  const { data } = await supabaseClient.auth.getSession()
+  const { data } = await sb.auth.getSession()
 
   if (data.session) {
     const email = data.session.user.email
@@ -976,7 +976,7 @@ async function sendMagicLink() {
       setTimeout(() => reject(new Error("Request timed out after 15 seconds.")), 15000)
     );
 
-    const otpPromise = supabaseClient.auth.signInWithOtp({
+    const otpPromise = sb.auth.signInWithOtp({
       email,
       options: {
         emailRedirectTo: window.location.origin
@@ -1000,14 +1000,14 @@ async function sendMagicLink() {
 }
 
 async function logout() {
-  await supabaseClient.auth.signOut();
+  await sb.auth.signOut();
 
   document.getElementById("loginStatus").textContent = "Logged out";
   document.getElementById("appContent").style.display = "none";
 }
 
 async function requireLogin() {
-  const { data } = await supabaseClient.auth.getSession();
+  const { data } = await sb.auth.getSession();
 
   if (!data.session) {
     alert("Please login first.");
@@ -1018,7 +1018,7 @@ async function requireLogin() {
 }
 
 async function authHeaders(extra = {}) {
-  const { data } = await supabaseClient.auth.getSession();
+  const { data } = await sb.auth.getSession();
   const token = data?.session?.access_token;
   if (!token) return { ...extra };
   return {
