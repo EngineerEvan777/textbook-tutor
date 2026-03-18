@@ -797,7 +797,13 @@ def home():
 
 <body>
   <div style="margin:20px 0;padding:15px;border:1px solid #ccc;border-radius:8px;">
-    <h3>Login</h3>
+    <h3>Login or Create Account</h3>
+
+    <div style="margin-bottom:10px;color:#555;font-size:14px;line-height:1.4;">
+      New user? Enter your email and password, then click <b>Create Account</b> once.
+      After that, use <b>Login with Password</b> with the same email and password.
+      You can also use <b>Email Me a Magic Link</b> instead.
+    </div>
 
     <input
       type="email"
@@ -814,15 +820,15 @@ def home():
     />
 
     <button onclick="loginWithPassword()" style="padding:8px 14px;">
-      Login
+      Login with Password
     </button>
 
     <button onclick="signUpWithPassword()" style="padding:8px 14px;margin-left:10px;">
-      Sign Up
+      Create Account
     </button>
 
     <button onclick="sendMagicLink()" style="padding:8px 14px;margin-left:10px;">
-      Magic Link
+      Email Me a Magic Link
     </button>
 
     <button onclick="logout()" style="padding:8px 14px;margin-left:10px;">
@@ -1056,7 +1062,11 @@ async function loginWithPassword() {
     });
 
     if (error) {
-      status.textContent = "Error: " + error.message;
+      if ((error.message || "").toLowerCase().includes("invalid login credentials")) {
+        status.textContent = "Login failed. Double-check your email and password.";
+      } else {
+        status.textContent = "Error: " + error.message;
+      }
     } else {
       status.textContent = "Logged in successfully.";
       document.getElementById("loginPassword").value = "";
@@ -1102,7 +1112,7 @@ async function signUpWithPassword() {
     }
 
     if (data?.user) {
-      status.textContent = "Account created. You can now log in with your password.";
+      status.textContent = "Account created. You can now log in with your email and password.";
       document.getElementById("loginPassword").value = "";
     } else {
       status.textContent = "Sign-up started. Check your email if confirmation is required.";
