@@ -22,10 +22,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
+import requests
 
 # ----------------------------
 # Logging
@@ -101,6 +102,8 @@ class Chunk:
 @dataclass
 class BookIndex:
     book_id: str
+    owner_user_id: str
+    owner_email: str
     title: str
     page_total: int
     chunks: List[Chunk]
@@ -109,7 +112,76 @@ class BookIndex:
 
 
 BOOKS: Dict[str, BookIndex] = {}
-SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # session_id -> [{"role": "...", "content": "..."}]
+SESSIONS: Dict[str, List[Dict[str, str]]] = {}  # cache key = f"{user_id}:{session_id}"
+
+
+# ----------------------------
+# Auth helpers (Supabase)
+# ----------------------------
+def get_supabase_url() -> str:
+    url = os.getenv("SUPABASE_URL", "").strip()
+    if not url:
+        raise HTTPException(status_code=500, detail="Server misconfigured: SUPABASE_URL is not set.")
+    return url.rstrip("/")
+
+
+def get_supabase_publishable_key() -> str:
+    key = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
+    if not key:
+        raise HTTPException(status_code=500, detail="Server misconfigured: SUPABASE_PUBLISHABLE_KEY is not set.")
+    return key
+
+
+def parse_bearer_token(authorization: Optional[str]) -> str:
+    auth = (authorization or "").strip()
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    return token
+
+
+def get_current_user(authorization: Optional[str]) -> Dict[str, str]:
+    token = parse_bearer_token(authorization)
+    url = f"{get_supabase_url()}/auth/v1/user"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "apikey": get_supabase_publishable_key(),
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        logger.error("Supabase auth request failed: %s", repr(e))
+        raise HTTPException(status_code=502, detail="Could not verify login with Supabase.")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired login. Please sign in again.")
+
+    data = resp.json()
+    user_id = (data.get("id") or "").strip()
+    email = (data.get("email") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Could not determine authenticated user.")
+
+    return {"id": user_id, "email": email}
+
+
+def get_session_cache_key(user_id: str, session_id: str) -> str:
+    return f"{user_id}:{session_id}"
+
+
+def safe_user_key(user_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", user_id)
+
+
+def session_file_path(user_id: str, session_id: str) -> Path:
+    return SESSION_DIR / f"{safe_user_key(user_id)}__{session_id}.json"
+
+
+def usage_file_path(user_id: str, session_id: str) -> Path:
+    return SESSION_DIR / f"{safe_user_key(user_id)}__{session_id}_usage.json"
 
 
 # ----------------------------
@@ -158,6 +230,8 @@ def save_book_to_disk(book: BookIndex) -> None:
 
     meta = {
         "book_id": book.book_id,
+        "owner_user_id": book.owner_user_id,
+        "owner_email": book.owner_email,
         "title": book.title,
         "page_total": book.page_total,
         "num_chunks": len(book.chunks),
@@ -203,6 +277,8 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
 
     return BookIndex(
         book_id=meta["book_id"],
+        owner_user_id=(meta.get("owner_user_id") or ""),
+        owner_email=(meta.get("owner_email") or ""),
         title=meta["title"],
         page_total=int(meta["page_total"]),
         chunks=chunks,
@@ -210,16 +286,25 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
     )
 
 
-def save_session_to_disk(session_id: str, history: List[Dict[str, str]]) -> None:
-    path = SESSION_DIR / f"{session_id}.json"
-    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_session_to_disk(user_id: str, session_id: str, history: List[Dict[str, str]]) -> None:
+    path = session_file_path(user_id, session_id)
+    payload = {
+        "owner_user_id": user_id,
+        "session_id": session_id,
+        "history": history,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def load_session_from_disk(session_id: str) -> List[Dict[str, str]]:
-    path = SESSION_DIR / f"{session_id}.json"
+def load_session_from_disk(user_id: str, session_id: str) -> List[Dict[str, str]]:
+    path = session_file_path(user_id, session_id)
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8"))
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return data
+    return data.get("history", [])
 
 
 def split_into_chunks(text: str, target_chars: int, overlap_chars: int) -> List[str]:
@@ -424,7 +509,7 @@ def favicon():
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
+    html = """
 <!doctype html>
 <html>
 <head>
@@ -828,8 +913,8 @@ def home():
 
 <script>
 
-const SUPABASE_URL = "https://rdupnwvpngtnivdsxwih.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_hzHLad6qTzjxZ248aDRpLQ_1f88UamG";
+const SUPABASE_URL = __SUPABASE_URL__;
+const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_KEY__;
 
 const supabaseClient = supabase.createClient(
   SUPABASE_URL,
@@ -850,6 +935,8 @@ async function showUser() {
       "Logged in as: " + email
 
     document.getElementById("appContent").style.display = "block"
+    refreshBooks();
+    refreshUsage();
 
   } else {
 
@@ -857,6 +944,15 @@ async function showUser() {
       "Please login to use Textbook Tutor."
 
     document.getElementById("appContent").style.display = "none"
+    const sel = document.getElementById("bookSelect");
+    if (sel) {
+      sel.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.value = "";
+      opt.textContent = "Login to view your books";
+      sel.appendChild(opt);
+      sel.disabled = true;
+    }
   }
 }
 
@@ -896,6 +992,16 @@ async function requireLogin() {
   }
 
   return true;
+}
+
+async function authHeaders(extra = {}) {
+  const { data } = await supabaseClient.auth.getSession();
+  const token = data?.session?.access_token;
+  if (!token) return { ...extra };
+  return {
+    Authorization: `Bearer ${token}`,
+    ...extra
+  };
 }
 
 /* -------------------------
@@ -994,8 +1100,13 @@ async function refreshBooks() {
   btn.textContent = "Refreshing…";
   try{
     setServiceState("work", "Refreshing books");
-    const r = await fetch('/books');
+    const headers = await authHeaders();
+    const r = await fetch('/books', { headers });
     const data = await r.json();
+
+    if (!r.ok) {
+      throw new Error(data.detail || 'Failed to load books');
+    }
 
     const sel = $("bookSelect");
     const prev = localStorage.getItem("tt_book_id") || sel.value;
@@ -1021,7 +1132,6 @@ async function refreshBooks() {
       sel.appendChild(opt);
     });
 
-    // try restore selection
     if (prev){
       const match = Array.from(sel.options).find(o => o.value === prev);
       if (match) sel.value = prev;
@@ -1048,8 +1158,13 @@ async function refreshUsage() {
   }
 
   try{
-    const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid));
+    const headers = await authHeaders();
+    const r = await fetch('/session/usage?session_id=' + encodeURIComponent(sid), { headers });
     const data = await r.json();
+
+    if (!r.ok) {
+      throw new Error(data.detail || 'Failed to load usage');
+    }
 
     const total = (data.total_tokens || 0).toLocaleString();
     const input = (data.input_tokens || 0).toLocaleString();
@@ -1076,9 +1191,10 @@ async function resetSession() {
   const sid = $("sessionId").value.trim();
   if (!sid) return;
   try{
+    const headers = await authHeaders({'Content-Type':'application/json'});
     await fetch('/session/reset', {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers,
       body: JSON.stringify({session_id: sid})
     });
     $("chat").innerHTML = '';
@@ -1135,7 +1251,8 @@ async function upload() {
   startUploadTimer();
 
   try{
-    const r = await fetch('/upload', {method:'POST', body: fd});
+    const headers = await authHeaders();
+    const r = await fetch('/upload', {method:'POST', body: fd, headers});
     const data = await r.json();
 
     if (!r.ok) {
@@ -1189,9 +1306,10 @@ async function ask() {
   setAskingState(true);
 
   try{
+    const headers = await authHeaders({'Content-Type':'application/json'});
     const r = await fetch('/chat', {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers,
       body: JSON.stringify({book_id, session_id, question})
     });
     const data = await r.json();
@@ -1238,8 +1356,6 @@ $("q").addEventListener('keydown', function(e) {
 /* Boot */
 restore();
 if (!$("sessionId").value.trim()) $("sessionId").value = uuidv4();
-refreshBooks();
-refreshUsage();
 setServiceState("ok","Ready");
 setChatState("ok","Idle");
 showUser();
@@ -1247,13 +1363,18 @@ showUser();
 </body>
 </html>
 """
-
+    html = html.replace("__SUPABASE_URL__", json.dumps(os.getenv("SUPABASE_URL", "")))
+    html = html.replace("__SUPABASE_KEY__", json.dumps(os.getenv("SUPABASE_PUBLISHABLE_KEY", "")))
+    return html
 
 
 @app.get("/books")
-def list_books():
+def list_books(authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
     out = []
     for b in BOOKS.values():
+        if b.owner_user_id != user["id"]:
+            continue
         out.append({
             "book_id": b.book_id,
             "title": b.title,
@@ -1265,8 +1386,13 @@ def list_books():
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), title: Optional[str] = Form(None)):
-    logger.info("Upload started")
+async def upload(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = get_current_user(authorization)
+    logger.info("Upload started for user_id=%s", user["id"])
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
@@ -1321,9 +1447,10 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = Form(None)
     logger.info("Building FAISS index")
     idx = build_faiss_ip_index(embs)
 
-    # Create the book object without keeping embeddings in RAM
     book = BookIndex(
         book_id=book_id,
+        owner_user_id=user["id"],
+        owner_email=user["email"],
         title=book_title,
         page_total=num_pages,
         chunks=chunks,
@@ -1333,38 +1460,44 @@ async def upload(file: UploadFile = File(...), title: Optional[str] = Form(None)
 
     BOOKS[book_id] = book
 
-    # Temporarily attach embeddings so they can be saved to disk
     book.embeddings = embs
     save_book_to_disk(book)
     book.embeddings = None
 
-    logger.info("Upload finished")
+    logger.info("Upload finished for user_id=%s book_id=%s", user["id"], book_id)
 
     return {"book_id": book_id, "title": book_title, "page_total": num_pages, "num_chunks": len(chunks)}
 
 
 @app.post("/session/reset")
-def reset_session(payload: Dict[str, str]):
+def reset_session(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
     sid = (payload.get("session_id") or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="Missing session_id.")
-    SESSIONS[sid] = []
-    path = SESSION_DIR / f"{sid}.json"
+
+    cache_key = get_session_cache_key(user["id"], sid)
+    SESSIONS[cache_key] = []
+
+    path = session_file_path(user["id"], sid)
     if path.exists():
         path.unlink()
-    usage_path = SESSION_DIR / f"{sid}_usage.json"
+
+    usage_path = usage_file_path(user["id"], sid)
     if usage_path.exists():
         usage_path.unlink()
+
     return {"ok": True}
 
 
 @app.get("/session/usage")
-def get_session_usage(session_id: str):
+def get_session_usage(session_id: str, authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
     sid = (session_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="Missing session_id.")
 
-    usage_file = SESSION_DIR / f"{sid}_usage.json"
+    usage_file = usage_file_path(user["id"], sid)
     if not usage_file.exists():
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -1375,7 +1508,9 @@ def get_session_usage(session_id: str):
 
 
 @app.post("/chat")
-def chat(payload: Dict[str, str]):
+def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
+
     book_id = (payload.get("book_id") or "").strip()
     session_id = (payload.get("session_id") or "").strip()
     question = (payload.get("question") or "").strip()
@@ -1391,9 +1526,13 @@ def chat(payload: Dict[str, str]):
         raise HTTPException(status_code=400, detail="Missing session_id.")
 
     book = BOOKS[book_id]
-    history = SESSIONS.get(session_id)
+    if book.owner_user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="You do not have access to this textbook.")
+
+    cache_key = get_session_cache_key(user["id"], session_id)
+    history = SESSIONS.get(cache_key)
     if history is None:
-        history = load_session_from_disk(session_id)
+        history = load_session_from_disk(user["id"], session_id)
 
     page_filter = extract_page_filter(question)
     if page_filter:
@@ -1408,10 +1547,10 @@ def chat(payload: Dict[str, str]):
 
     history.append({"role": "user", "content": question})
     history.append({"role": "assistant", "content": answer})
-    SESSIONS[session_id] = history
-    save_session_to_disk(session_id, history)
+    SESSIONS[cache_key] = history
+    save_session_to_disk(user["id"], session_id, history)
 
-    usage_file = SESSION_DIR / f"{session_id}_usage.json"
+    usage_file = usage_file_path(user["id"], session_id)
     current = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     if usage_file.exists():
         try:
@@ -1423,8 +1562,6 @@ def chat(payload: Dict[str, str]):
     current["output_tokens"] += usage["output_tokens"]
     current["total_tokens"] += usage["total_tokens"]
     usage_file.write_text(json.dumps(current, indent=2), encoding="utf-8")
-
-    
 
     return {
         "answer": answer,
