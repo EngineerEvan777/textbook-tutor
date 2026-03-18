@@ -802,6 +802,7 @@ def home():
     <div style="margin-bottom:10px;color:#555;font-size:14px;line-height:1.4;">
       New user? Enter your email and password, then click <b>Create Account</b> once.
       After that, use <b>Login with Password</b> with the same email and password.
+      Already using magic link? Log in first, then click <b>Set Password</b>.
       You can also use <b>Email Me a Magic Link</b> instead.
     </div>
 
@@ -825,6 +826,10 @@ def home():
 
     <button onclick="signUpWithPassword()" style="padding:8px 14px;margin-left:10px;">
       Create Account
+    </button>
+
+    <button onclick="setPasswordForCurrentUser()" style="padding:8px 14px;margin-left:10px;">
+      Set Password
     </button>
 
     <button onclick="sendMagicLink()" style="padding:8px 14px;margin-left:10px;">
@@ -958,6 +963,52 @@ try {
   console.error("Supabase client init failed:", err);
   document.getElementById("loginStatus").textContent =
     "Error initializing login: " + (err.message || String(err));
+}
+
+async function setPasswordForCurrentUser() {
+  const password = document.getElementById("loginPassword").value;
+  const status = document.getElementById("loginStatus");
+
+  if (!sb) {
+    status.textContent = "Login is not initialized. Check Supabase settings.";
+    return;
+  }
+
+  if (!password) {
+    status.textContent = "Please enter a password first.";
+    return;
+  }
+
+  if (password.length < 8) {
+    status.textContent = "Password must be at least 8 characters.";
+    return;
+  }
+
+  try {
+    const { data } = await sb.auth.getSession();
+
+    if (!data.session) {
+      status.textContent = "Please log in with a magic link first, then click Set Password.";
+      return;
+    }
+
+    status.textContent = "Setting password...";
+
+    const { error } = await sb.auth.updateUser({
+      password: password
+    });
+
+    if (error) {
+      status.textContent = "Error: " + error.message;
+      return;
+    }
+
+    document.getElementById("loginPassword").value = "";
+    status.textContent = "Password set successfully. You can now use Login with Password next time.";
+  } catch (err) {
+    console.error("setPasswordForCurrentUser failed:", err);
+    status.textContent = "Error: " + (err.message || String(err));
+  }
 }
 
 async function showUser() {
@@ -1107,7 +1158,13 @@ async function signUpWithPassword() {
     });
 
     if (error) {
-      status.textContent = "Error: " + error.message;
+      const msg = (error.message || "").toLowerCase();
+
+      if (msg.includes("user already registered")) {
+        status.textContent = "This email already has an account. Use Login with Password, or log in with a magic link and click Set Password.";
+      } else {
+        status.textContent = "Error: " + error.message;
+      }
       return;
     }
 
