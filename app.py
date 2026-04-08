@@ -487,6 +487,41 @@ STUDENT QUESTION:
 Answer:
 """.strip()
 
+def keyword_bonus(query: str, text: str) -> float:
+    q = query.lower()
+    t = text.lower()
+    bonus = 0.0
+
+    # Strong phrase matches
+    if "zeroth law" in q and "zeroth law" in t:
+        bonus += 0.40
+    if "first law" in q and "first law" in t:
+        bonus += 0.40
+    if "second law" in q and "second law" in t:
+        bonus += 0.40
+    if "third law" in q and "third law" in t:
+        bonus += 0.40
+
+    # Weaker word-level support
+    if "zeroth" in q and "zeroth" in t:
+        bonus += 0.20
+    if "first" in q and "first" in t:
+        bonus += 0.20
+    if "second" in q and "second" in t:
+        bonus += 0.20
+    if "third" in q and "third" in t:
+        bonus += 0.20
+
+    if "law" in q and "law" in t:
+        bonus += 0.10
+
+    # Helpful thermo concept tied to zeroth law
+    if "thermal equilibrium" in q and "thermal equilibrium" in t:
+        bonus += 0.20
+    elif "zeroth" in q and "thermal equilibrium" in t:
+        bonus += 0.10
+
+    return bonus
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
     q = embed_texts_openai([query])
@@ -497,13 +532,17 @@ def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float
     candidate_k = min(max(top_k * 3, 12), len(book.chunks))
     scores, ids = book.index.search(q, candidate_k)
 
-    hits: List[Tuple[Chunk, float]] = []
+    rescored: List[Tuple[Chunk, float]] = []
     for i, score in zip(ids[0], scores[0]):
         if i < 0:
             continue
-        hits.append((book.chunks[int(i)], float(score)))
 
-    return hits[:top_k]
+        chunk = book.chunks[int(i)]
+        adjusted_score = float(score) + keyword_bonus(query, chunk.text)
+        rescored.append((chunk, adjusted_score))
+
+    rescored.sort(key=lambda x: x[1], reverse=True)
+    return rescored[:top_k]
 
 
 # ----------------------------
