@@ -196,6 +196,12 @@ def normalize_query(query: str) -> str:
         (r"\b2nd\b", "second"),
         (r"\b3rd\b", "third"),
         (r"\b4th\b", "fourth"),
+        (r"\b5th\b", "fifth"),
+        (r"\b6th\b", "sixth"),
+        (r"\b7th\b", "seventh"),
+        (r"\b8th\b", "eighth"),
+        (r"\b9th\b", "ninth"),
+        (r"\b10th\b", "tenth"),
     ]
 
     for pat, repl in replacements:
