@@ -187,6 +187,22 @@ def usage_file_path(user_id: str, session_id: str) -> Path:
 # ----------------------------
 # Helpers
 # ----------------------------
+def normalize_query(query: str) -> str:
+    q = query.strip()
+
+    replacements = [
+        (r"\b0th\b", "zeroth"),
+        (r"\b1st\b", "first"),
+        (r"\b2nd\b", "second"),
+        (r"\b3rd\b", "third"),
+        (r"\b4th\b", "fourth"),
+    ]
+
+    for pat, repl in replacements:
+        q = re.sub(pat, repl, q, flags=re.IGNORECASE)
+
+    return q
+
 def extract_page_filter(question: str) -> Optional[int]:
     q = question.lower()
     patterns = [
@@ -474,16 +490,20 @@ Answer:
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
     q = embed_texts_openai([query])
-    # FAISS index is the source of truth; embeddings may not be kept in RAM
+
     if book.index is None:
         return []
-    scores, ids = book.index.search(q, top_k)
+
+    candidate_k = min(max(top_k * 3, 12), len(book.chunks))
+    scores, ids = book.index.search(q, candidate_k)
+
     hits: List[Tuple[Chunk, float]] = []
     for i, score in zip(ids[0], scores[0]):
         if i < 0:
             continue
         hits.append((book.chunks[int(i)], float(score)))
-    return hits
+
+    return hits[:top_k]
 
 
 # ----------------------------
@@ -907,6 +927,7 @@ def home():
             <div class="row" style="margin-top:10px;">
               <button class="secondary" id="refreshBtn" onclick="refreshBooks()">Refresh books</button>
               <button class="secondary" onclick="resetSession()">Reset session</button>
+              <button class="secondary" id="deleteBookBtn" onclick="deleteSelectedBook()">Delete selected book</button>
 
               <div class="muted" id="usageLine" style="margin-left:auto;">Usage: (loading...)</div>
             </div>
@@ -1406,6 +1427,49 @@ async function refreshBooks() {
   }
 }
 
+async function deleteSelectedBook() {
+  if (!(await requireLogin())) return;
+
+  const sel = $("bookSelect");
+  const book_id = sel.value;
+
+  if (!book_id) {
+    toast("bad", "No book selected", "Choose a book first.");
+    return;
+  }
+
+  const selectedText = sel.options[sel.selectedIndex]?.textContent || "this book";
+  const ok = confirm(`Delete "${selectedText}"? This cannot be undone.`);
+  if (!ok) return;
+
+  const btn = $("deleteBookBtn");
+  btn.disabled = true;
+  btn.textContent = "Deleting…";
+
+  try {
+    const headers = await authHeaders({ 'Content-Type': 'application/json' });
+    const r = await fetch('/books/delete', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ book_id })
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      throw new Error(data.detail || "Failed to delete book");
+    }
+
+    toast("ok", "Book deleted", `"${selectedText}" was removed.`);
+    await refreshBooks();
+  } catch (e) {
+    toast("bad", "Couldn’t delete book", String(e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Delete selected book";
+  }
+}
+
 async function refreshUsage() {
   const sid = $("sessionId").value.trim();
   const el = $("usageLine");
@@ -1641,6 +1705,38 @@ def list_books(authorization: Optional[str] = Header(default=None)):
     out.sort(key=lambda x: x["title"].lower())
     return {"books": out}
 
+@app.post("/books/delete")
+def delete_book(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
+    book_id = (payload.get("book_id") or "").strip()
+
+    if not book_id:
+        raise HTTPException(status_code=400, detail="Missing book_id.")
+
+    if book_id not in BOOKS:
+        raise HTTPException(status_code=404, detail="Book not found.")
+
+    book = BOOKS[book_id]
+    if book.owner_user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="You do not have access to delete this textbook.")
+
+    # Remove from memory
+    del BOOKS[book_id]
+
+    # Remove from disk
+    p = book_paths(book_id, create=False)
+    if p["dir"].exists():
+        for child in p["dir"].iterdir():
+            try:
+                child.unlink()
+            except Exception:
+                pass
+        try:
+            p["dir"].rmdir()
+        except Exception:
+            pass
+
+    return {"ok": True, "deleted_book_id": book_id}
 
 @app.post("/upload")
 async def upload(
@@ -1791,12 +1887,14 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
     if history is None:
         history = load_session_from_disk(user["id"], session_id)
 
+    normalized_question = normalize_query(question)
+
     page_filter = extract_page_filter(question)
     if page_filter:
         filtered = [(c, 1.0) for c in book.chunks if c.page_pdf == page_filter]
         hits = filtered[:TOP_K]
     else:
-        hits = retrieve(book, question, TOP_K)
+        hits = retrieve(book, normalized_question, TOP_K)
 
     prompt = build_prompt(question, hits, history)
     answer, usage = llm_generate(prompt)
