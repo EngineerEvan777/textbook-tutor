@@ -83,6 +83,9 @@ MAX_CONTEXT_CHARS = 12000
 CHUNK_TARGET_CHARS = 1200
 CHUNK_OVERLAP_CHARS = 200
 
+# Book limits
+MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
+
 # Embeddings (OpenAI)
 EMBED_MODEL_NAME = "text-embedding-3-small"  # small + cheap + good enough
 EMBED_DIM = 1536  # for text-embedding-3-small
@@ -1791,6 +1794,17 @@ async def upload(
 ):
     user = get_current_user(authorization)
     logger.info("Upload started for user_id=%s", user["id"])
+
+    user_book_count = sum(
+        1 for b in BOOKS.values()
+        if b.owner_user_id == user["id"]
+    )
+
+    if user_book_count >= MAX_BOOKS_PER_USER:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You can save up to {MAX_BOOKS_PER_USER} books. Delete one before uploading another."
+        )
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file.")
