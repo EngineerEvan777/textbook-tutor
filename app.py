@@ -1918,13 +1918,15 @@ def get_session_usage(session_id: str, authorization: Optional[str] = Header(def
     except Exception:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-def log_asked_question(user: Dict[str, str], question: str) -> None:
+def log_asked_question(user: Dict[str, str], question: str, authorization: Optional[str]) -> None:
     try:
+        token = parse_bearer_token(authorization)
+
         url = f"{get_supabase_url()}/rest/v1/asked_questions"
 
         headers = {
             "apikey": get_supabase_publishable_key(),
-            "Authorization": f"Bearer {get_supabase_publishable_key()}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Prefer": "return=minimal",
         }
@@ -1938,11 +1940,7 @@ def log_asked_question(user: Dict[str, str], question: str) -> None:
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
 
         if resp.status_code >= 300:
-            logger.warning(
-                "Question logging failed: %s %s",
-                resp.status_code,
-                resp.text,
-            )
+            logger.warning("Question logging failed: %s %s", resp.status_code, resp.text)
 
     except Exception as e:
         logger.warning("Failed to log question: %s", repr(e))
@@ -1957,13 +1955,17 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
 
     if len(question) > 4000:
         raise HTTPException(status_code=400, detail="Question too long (max 4000 chars).")
+
     if len(question) < 2:
         raise HTTPException(status_code=400, detail="Please type a longer question.")
-    log_asked_question(user, question)
+
     if not book_id or book_id not in BOOKS:
         raise HTTPException(status_code=400, detail="Invalid or missing book_id.")
+
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session_id.")
+
+    log_asked_question(user, question, authorization)
 
     book = BOOKS[book_id]
     if book.owner_user_id != user["id"]:
