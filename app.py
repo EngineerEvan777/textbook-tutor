@@ -1938,7 +1938,11 @@ def log_asked_question(user: Dict[str, str], question: str) -> None:
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
 
         if resp.status_code >= 300:
-            logger.warning("Question logging failed: %s %s", resp.status_code, resp.text)
+            logger.warning(
+                "Question logging failed: %s %s",
+                resp.status_code,
+                resp.text,
+            )
 
     except Exception as e:
         logger.warning("Failed to log question: %s", repr(e))
