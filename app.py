@@ -1918,6 +1918,30 @@ def get_session_usage(session_id: str, authorization: Optional[str] = Header(def
     except Exception:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+def log_asked_question(user: Dict[str, str], question: str) -> None:
+    try:
+        url = f"{get_supabase_url()}/rest/v1/asked_questions"
+
+        headers = {
+            "apikey": get_supabase_publishable_key(),
+            "Authorization": f"Bearer {get_supabase_publishable_key()}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+
+        payload = {
+            "user_id": user["id"],
+            "user_email": user["email"],
+            "question": question,
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+
+        if resp.status_code >= 300:
+            logger.warning("Question logging failed: %s %s", resp.status_code, resp.text)
+
+    except Exception as e:
+        logger.warning("Failed to log question: %s", repr(e))
 
 @app.post("/chat")
 def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
@@ -1931,7 +1955,7 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
         raise HTTPException(status_code=400, detail="Question too long (max 4000 chars).")
     if len(question) < 2:
         raise HTTPException(status_code=400, detail="Please type a longer question.")
-
+    log_asked_question(user, question)
     if not book_id or book_id not in BOOKS:
         raise HTTPException(status_code=400, detail="Invalid or missing book_id.")
     if not session_id:
