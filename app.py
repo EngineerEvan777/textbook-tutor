@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Request
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
@@ -76,6 +76,7 @@ BOOK_DIR = DATA_DIR / "books"
 SESSION_DIR = DATA_DIR / "sessions"
 BOOK_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
+EVENT_LOG_PATH = DATA_DIR / "funnel_events.jsonl"
 
 # Retrieval params
 TOP_K = 6
@@ -575,6 +576,64 @@ def favicon():
     return Response(status_code=204)
 
 
+def get_supabase_service_key() -> str:
+    return os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+
+def write_funnel_event(row: Dict[str, object]) -> None:
+    EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with EVENT_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    service_key = get_supabase_service_key()
+    if not service_key:
+        return
+
+    try:
+        url = f"{get_supabase_url()}/rest/v1/tt_funnel_events"
+        headers = {
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        resp = requests.post(url, headers=headers, json=row, timeout=8)
+        if resp.status_code >= 300:
+            logger.warning("Funnel event Supabase insert failed: %s %s", resp.status_code, resp.text[:300])
+    except Exception as e:
+        logger.warning("Funnel event forwarding failed: %s", repr(e))
+
+
+@app.post("/track")
+async def track_event(payload: Dict[str, object], request: Request):
+    event_name = str(payload.get("event_name") or payload.get("event") or "").strip()
+    if not event_name:
+        raise HTTPException(status_code=400, detail="event_name is required.")
+
+    props = payload.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+
+    row = {
+        "event_name": event_name,
+        "source": str(payload.get("source") or "textbook_tutor_app"),
+        "email": (str(payload.get("email") or props.get("email") or "").strip().lower() or None),
+        "session_id": (str(payload.get("session_id") or props.get("session_id") or "").strip() or None),
+        "url": str(payload.get("url") or ""),
+        "referrer": str(payload.get("referrer") or ""),
+        "user_agent": request.headers.get("user-agent"),
+        "occurred_at": str(payload.get("occurred_at") or ""),
+        "properties": props,
+    }
+
+    try:
+        write_funnel_event(row)
+    except Exception as e:
+        logger.warning("Failed to write funnel event: %s", repr(e))
+
+    return {"ok": True}
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     html = """
@@ -953,7 +1012,7 @@ def home():
             </div>
 
             <div class="muted" style="margin-top:10px;">
-              Tip: Large PDFs can take a bit to chunk + embed. If you’re on Render Free, keep the book under ~80MB.
+              Tip: Large PDFs can take a few minutes to process. For fastest results, start with a clean, text-based PDF under 80MB.
             </div>
           </div>
 
@@ -1019,6 +1078,53 @@ const SUPABASE_URL = __SUPABASE_URL__;
 const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_KEY__;
 
 let sb = null;
+
+function checkoutEmailFallback() {
+  const input = document.getElementById("loginEmail");
+  return input && input.value ? input.value.trim().toLowerCase() : "";
+}
+
+async function currentTrackingEmail() {
+  try {
+    if (!sb) return checkoutEmailFallback();
+    const { data } = await sb.auth.getSession();
+    return (data?.session?.user?.email || checkoutEmailFallback() || "").toLowerCase();
+  } catch (err) {
+    return checkoutEmailFallback();
+  }
+}
+
+async function trackEvent(eventName, properties = {}) {
+  window.dataLayer = window.dataLayer || [];
+  const email = await currentTrackingEmail();
+  const payload = {
+    event_name: eventName,
+    source: "textbook_tutor_app",
+    email,
+    url: window.location.href,
+    referrer: document.referrer || "",
+    occurred_at: new Date().toISOString(),
+    properties: {
+      ...properties,
+      path: window.location.pathname,
+      session_id: document.getElementById("sessionId")?.value?.trim() || ""
+    }
+  };
+
+  window.dataLayer.push({
+    event: eventName,
+    product: "textbook_tutor",
+    properties: payload.properties,
+    ts: payload.occurred_at
+  });
+
+  fetch("/track", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+    keepalive: true
+  }).catch(() => {});
+}
 
 try {
   console.log("SUPABASE_URL:", SUPABASE_URL);
@@ -1125,6 +1231,7 @@ async function showUser() {
 
     document.getElementById("loginEmail").value = email || "";
     document.getElementById("appContent").style.display = "block";
+    trackEvent("tt_app_authenticated", {email});
     setAuthUI(true);
     refreshBooks();
     refreshUsage();
@@ -1162,6 +1269,7 @@ async function sendMagicLink() {
   }
 
   status.textContent = "Sending login link...";
+  trackEvent("tt_magic_link_requested", {email});
 
   try {
     const timeoutPromise = new Promise((_, reject) =>
@@ -1205,6 +1313,7 @@ async function loginWithPassword() {
   }
 
   status.textContent = "Logging in...";
+  trackEvent("tt_login_intent", {email});
 
   try {
     const { error } = await sb.auth.signInWithPassword({
@@ -1220,6 +1329,7 @@ async function loginWithPassword() {
       }
     } else {
       status.textContent = "Logged in successfully.";
+      trackEvent("tt_login_success", {email});
       document.getElementById("loginPassword").value = "";
       await showUser();
     }
@@ -1250,6 +1360,7 @@ async function signUpWithPassword() {
   }
 
   status.textContent = "Creating account...";
+  trackEvent("tt_signup_intent", {email});
 
   try {
     const { data, error } = await sb.auth.signUp({
@@ -1280,6 +1391,7 @@ async function signUpWithPassword() {
 
     document.getElementById("loginPassword").value = "";
     status.textContent = "Account created and logged in successfully.";
+    trackEvent("tt_signup_success", {email});
     await showUser();
   } catch (err) {
     console.error("signUpWithPassword failed:", err);
@@ -1611,6 +1723,8 @@ async function upload() {
     return;
   }
 
+  trackEvent("tt_upload_intent", {file_name: f.name, file_size: f.size});
+
   const fd = new FormData();
   fd.append('file', f);
   if (title) fd.append('title', title);
@@ -1635,6 +1749,7 @@ async function upload() {
       `Uploaded: ${data.title} • ${data.page_total} pages • ${data.num_chunks} chunks (in ${secs}s)`;
 
     toast("ok", "Upload complete", `Indexed “${data.title}” in ${secs}s.`);
+    trackEvent("tt_first_or_repeat_upload", {book_id: data.book_id, title: data.title, page_total: data.page_total, num_chunks: data.num_chunks, duration_seconds: Number(secs)});
     await refreshBooks();
     collapseSetupIfReady();
   } catch(e){
@@ -1668,6 +1783,7 @@ async function ask() {
   if (!question) return;
 
   persist();
+  trackEvent("tt_question_intent", {book_id, question_length: question.length});
 
   addMessage('user', question);
   $("q").value = '';
@@ -1690,6 +1806,7 @@ async function ask() {
       return;
     }
 
+    trackEvent("tt_first_or_repeat_question", {book_id, session_id, has_answer: Boolean(data.answer), total_tokens: data.usage?.total_tokens || 0});
     addMessage('assistant', data.answer || '(no answer)');
     addMeta('CITATIONS: ' + (data.citations || '(none)'));
 
@@ -1723,6 +1840,7 @@ $("q").addEventListener('keydown', function(e) {
 });
 
 /* Boot */
+trackEvent("tt_app_view", {});
 restore();
 if (!$("sessionId").value.trim()) $("sessionId").value = uuidv4();
 setServiceState("ok","Ready");
