@@ -3,7 +3,8 @@ Textbook Office-Hours Tutor (single-file FastAPI)
 
 Render-friendly version:
 - NO sentence-transformers / torch
-- Uses OpenAI embeddings + FAISS (faiss-cpu)
+- Uses SQLite FTS5/BM25 by default for fast indexing
+- Optional OpenAI embeddings + FAISS (faiss-cpu)
 """
 
 import os
@@ -12,6 +13,7 @@ import traceback
 import json
 import io
 import re
+import sqlite3
 import uuid
 import time
 from pathlib import Path
@@ -71,6 +73,30 @@ def get_faiss():
 # ----------------------------
 # Config
 # ----------------------------
+def int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    return value if value > 0 else default
+
+
+def bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+    return default
+
+
 DATA_DIR = Path("./data")
 BOOK_DIR = DATA_DIR / "books"
 SESSION_DIR = DATA_DIR / "sessions"
@@ -80,15 +106,21 @@ SESSION_DIR.mkdir(parents=True, exist_ok=True)
 # Retrieval params
 TOP_K = 6
 MAX_CONTEXT_CHARS = 12000
-CHUNK_TARGET_CHARS = 1200
-CHUNK_OVERLAP_CHARS = 200
+CHUNK_TARGET_CHARS = int_env("CHUNK_TARGET_CHARS", 1800)
+CHUNK_OVERLAP_CHARS = int_env("CHUNK_OVERLAP_CHARS", 100)
+MIN_CHUNK_CHARS = int_env("MIN_CHUNK_CHARS", 80)
+USE_BM25_RETRIEVAL = bool_env("USE_BM25_RETRIEVAL", True)
+BM25_CANDIDATE_K = int_env("BM25_CANDIDATE_K", 30)
 
 # Book limits
 MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
+MAX_PDF_MB = int_env("MAX_PDF_MB", 80)
 
 # Embeddings (OpenAI)
 EMBED_MODEL_NAME = "text-embedding-3-small"  # small + cheap + good enough
 EMBED_DIM = 1536  # for text-embedding-3-small
+EMBED_BATCH_SIZE = int_env("EMBED_BATCH_SIZE", 128)
+BUILD_EMBEDDINGS_ON_UPLOAD = bool_env("BUILD_EMBEDDINGS_ON_UPLOAD", False)
 
 
 # ----------------------------
@@ -110,7 +142,7 @@ class BookIndex:
     title: str
     page_total: int
     chunks: List[Chunk]
-    index: object          # faiss index
+    index: Optional[object]  # faiss index when embeddings are enabled
     embeddings: Optional[np.ndarray] = None
 
 
@@ -244,13 +276,58 @@ def book_paths(book_id: str, create: bool = True) -> Dict[str, Path]:
         "dir": d,
         "meta": d / "meta.json",
         "chunks": d / "chunks.jsonl",
+        "bm25": d / "bm25.sqlite",
         "emb": d / "embeddings.npy",
         "faiss": d / "index.faiss",
     }
 
 
+def build_bm25_index(book_id: str, chunks: List[Chunk]) -> bool:
+    p = book_paths(book_id)
+    db_path = p["bm25"]
+
+    for suffix in ("", "-wal", "-shm"):
+        old_path = Path(str(db_path) + suffix)
+        if old_path.exists():
+            try:
+                old_path.unlink()
+            except Exception as e:
+                logger.warning("Could not remove old BM25 index file %s: %s", old_path, repr(e))
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(text, tokenize='unicode61')")
+        conn.executemany(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            ((i + 1, chunk.text) for i, chunk in enumerate(chunks)),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        logger.warning("Could not build BM25 index for book_id=%s: %s", book_id, repr(e))
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def ensure_bm25_index(book: BookIndex) -> bool:
+    if not USE_BM25_RETRIEVAL:
+        return False
+    p = book_paths(book.book_id, create=False)
+    if p["bm25"].exists():
+        return True
+    return build_bm25_index(book.book_id, book.chunks)
+
+
 def save_book_to_disk(book: BookIndex) -> None:
-    faiss = get_faiss()
     p = book_paths(book.book_id)
 
     meta = {
@@ -261,6 +338,7 @@ def save_book_to_disk(book: BookIndex) -> None:
         "page_total": book.page_total,
         "num_chunks": len(book.chunks),
         "embed_model": EMBED_MODEL_NAME,
+        "retrieval": "bm25+faiss" if book.index is not None else "bm25",
         "created_at": time.time(),
     }
     p["meta"].write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -276,15 +354,25 @@ def save_book_to_disk(book: BookIndex) -> None:
 
     if book.embeddings is not None:
         np.save(p["emb"], book.embeddings)
-    faiss.write_index(book.index, str(p["faiss"]))
+
+    build_bm25_index(book.book_id, book.chunks)
+
+    if book.index is not None:
+        faiss = get_faiss()
+        faiss.write_index(book.index, str(p["faiss"]))
+    else:
+        for path in (p["emb"], p["faiss"]):
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
 
 
 def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
     p = book_paths(book_id, create=False)
-    if not p["meta"].exists() or not p["chunks"].exists() or not p["faiss"].exists():
+    if not p["meta"].exists() or not p["chunks"].exists():
         return None
-
-    faiss = get_faiss()
 
     meta = json.loads(p["meta"].read_text(encoding="utf-8"))
     chunks: List[Chunk] = []
@@ -298,9 +386,15 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
                 text=obj["text"],
             ))
     
-    idx = faiss.read_index(str(p["faiss"]))
+    idx = None
+    if p["faiss"].exists():
+        try:
+            faiss = get_faiss()
+            idx = faiss.read_index(str(p["faiss"]))
+        except Exception as e:
+            logger.warning("Could not load FAISS index for book_id=%s: %s", book_id, repr(e))
 
-    return BookIndex(
+    book = BookIndex(
         book_id=meta["book_id"],
         owner_user_id=(meta.get("owner_user_id") or ""),
         owner_email=(meta.get("owner_email") or ""),
@@ -309,6 +403,9 @@ def load_book_from_disk(book_id: str) -> Optional[BookIndex]:
         chunks=chunks,
         index=idx
     )
+
+    ensure_bm25_index(book)
+    return book
 
 
 def save_session_to_disk(user_id: str, session_id: str, history: List[Dict[str, str]]) -> None:
@@ -372,12 +469,10 @@ def embed_texts_openai(texts: List[str]) -> np.ndarray:
 
     client = get_openai_client()
 
-    # Keep batches reasonable
-    BATCH = 64
     all_vecs: List[List[float]] = []
 
-    for i in range(0, len(texts), BATCH):
-        batch = texts[i:i+BATCH]
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i:i+EMBED_BATCH_SIZE]
         resp = client.embeddings.create(
             model=EMBED_MODEL_NAME,
             input=batch,
@@ -532,11 +627,110 @@ def keyword_bonus(query: str, text: str) -> float:
 
     return bonus
 
-def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
-    q = embed_texts_openai([query])
 
+BM25_STOPWORDS = {
+    "about", "above", "after", "again", "against", "also", "answer", "because",
+    "before", "being", "between", "both", "could", "does", "doing", "each",
+    "explain", "from", "have", "into", "like", "more", "most", "section",
+    "should", "show", "simply", "studying", "textbook", "than", "that", "then",
+    "there", "these", "they", "this", "those", "through", "what", "when", "where",
+    "which", "while", "with", "would", "your",
+}
+
+
+def bm25_query_terms(query: str) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
+    terms: List[str] = []
+    seen = set()
+
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        if token in BM25_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+
+    return terms[:20]
+
+
+def bm25_match_query(query: str) -> str:
+    terms = bm25_query_terms(query)
+    if not terms:
+        return ""
+    return " OR ".join(f'"{term}"' for term in terms)
+
+
+def retrieve_bm25(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    if not ensure_bm25_index(book):
+        return []
+
+    match_query = bm25_match_query(query)
+    if not match_query:
+        return []
+
+    p = book_paths(book.book_id, create=False)
+    candidate_k = min(max(top_k * 4, BM25_CANDIDATE_K), len(book.chunks))
+    conn = None
+
+    try:
+        conn = sqlite3.connect(str(p["bm25"]))
+        rows = conn.execute(
+            """
+            SELECT rowid, bm25(chunks_fts) AS rank
+            FROM chunks_fts
+            WHERE chunks_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (match_query, candidate_k),
+        ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning("BM25 retrieval failed for book_id=%s: %s", book.book_id, repr(e))
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+    hits: List[Tuple[Chunk, float]] = []
+    for rowid, rank in rows:
+        idx = int(rowid) - 1
+        if idx < 0 or idx >= len(book.chunks):
+            continue
+        chunk = book.chunks[idx]
+        adjusted_score = -float(rank) + keyword_bonus(query, chunk.text)
+        hits.append((chunk, adjusted_score))
+
+    hits.sort(key=lambda x: x[1], reverse=True)
+    return hits[:top_k]
+
+
+def retrieve_keyword_fallback(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    terms = bm25_query_terms(query)
+    if not terms:
+        return []
+
+    hits: List[Tuple[Chunk, float]] = []
+    for chunk in book.chunks:
+        text = chunk.text.lower()
+        score = keyword_bonus(query, chunk.text)
+        for term in terms:
+            if term in text:
+                score += text.count(term)
+        if score > 0:
+            hits.append((chunk, float(score)))
+
+    hits.sort(key=lambda x: x[1], reverse=True)
+    return hits[:top_k]
+
+
+def retrieve_faiss(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
     if book.index is None:
         return []
+
+    q = embed_texts_openai([query])
 
     candidate_k = min(max(top_k * 3, 12), len(book.chunks))
     scores, ids = book.index.search(q, candidate_k)
@@ -552,6 +746,19 @@ def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float
 
     rescored.sort(key=lambda x: x[1], reverse=True)
     return rescored[:top_k]
+
+
+def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    if USE_BM25_RETRIEVAL:
+        hits = retrieve_bm25(book, query, top_k)
+        if hits:
+            return hits
+
+    hits = retrieve_faiss(book, query, top_k)
+    if hits:
+        return hits
+
+    return retrieve_keyword_fallback(book, query, top_k)
 
 
 # ----------------------------
@@ -953,7 +1160,7 @@ def home():
             </div>
 
             <div class="muted" style="margin-top:10px;">
-              Tip: Large PDFs can take a bit to chunk + embed. If you’re on Render Free, keep the book under ~80MB.
+              Tip: Large PDFs can take a bit to extract + index. If you’re on Render Free, keep the book under ~__MAX_PDF_MB__MB.
             </div>
           </div>
 
@@ -1734,6 +1941,7 @@ showUser();
 """
     html = html.replace("__SUPABASE_URL__", json.dumps(os.getenv("SUPABASE_URL", "")))
     html = html.replace("__SUPABASE_KEY__", json.dumps(os.getenv("SUPABASE_PUBLISHABLE_KEY", "")))
+    html = html.replace("__MAX_PDF_MB__", str(MAX_PDF_MB))
     return html
 
 
@@ -1812,7 +2020,6 @@ async def upload(
     logger.info("Reading PDF")
     pdf_bytes = await file.read()
 
-    MAX_PDF_MB = 80
     if len(pdf_bytes) > MAX_PDF_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"PDF too large (max {MAX_PDF_MB} MB).")
     if not pdf_bytes:
@@ -1828,8 +2035,14 @@ async def upload(
     book_id = str(uuid.uuid4())
     book_title = (title or file.filename).strip() or "Untitled PDF"
 
-    logger.info("Splitting into chunks")
+    logger.info(
+        "Splitting into chunks with target=%s overlap=%s min=%s",
+        CHUNK_TARGET_CHARS,
+        CHUNK_OVERLAP_CHARS,
+        MIN_CHUNK_CHARS,
+    )
     chunks: List[Chunk] = []
+    seen_chunk_fingerprints = set()
     for p in range(num_pages):
         try:
             raw = reader.pages[p].extract_text() or ""
@@ -1841,6 +2054,13 @@ async def upload(
 
         page_chunks = split_into_chunks(raw, CHUNK_TARGET_CHARS, CHUNK_OVERLAP_CHARS)
         for ch_text in page_chunks:
+            ch_text = ch_text.strip()
+            if len(ch_text) < MIN_CHUNK_CHARS:
+                continue
+            fingerprint = re.sub(r"\s+", " ", ch_text.lower())
+            if fingerprint in seen_chunk_fingerprints:
+                continue
+            seen_chunk_fingerprints.add(fingerprint)
             chunks.append(Chunk(
                 book_id=book_id,
                 page_pdf=p + 1,
@@ -1853,11 +2073,16 @@ async def upload(
 
     texts = [c.text for c in chunks]
 
-    logger.info("Creating embeddings")
-    embs = embed_texts_openai(texts)
+    embs = None
+    idx = None
+    if BUILD_EMBEDDINGS_ON_UPLOAD:
+        logger.info("Creating embeddings for %s chunks with batch size %s", len(texts), EMBED_BATCH_SIZE)
+        embs = embed_texts_openai(texts)
 
-    logger.info("Building FAISS index")
-    idx = build_faiss_ip_index(embs)
+        logger.info("Building FAISS index")
+        idx = build_faiss_ip_index(embs)
+    else:
+        logger.info("Skipping embeddings on upload; BM25 retrieval will be used.")
 
     book = BookIndex(
         book_id=book_id,
