@@ -5,6 +5,7 @@ Render-friendly version:
 - NO sentence-transformers / torch
 - Uses SQLite FTS5/BM25 by default for fast indexing
 - Optional OpenAI embeddings + FAISS (faiss-cpu)
+- Visual PDF questions require PyMuPDF and Pillow in requirements.txt
 """
 
 import os
@@ -12,6 +13,7 @@ import logging
 import traceback
 import json
 import io
+import base64
 import re
 import sqlite3
 import uuid
@@ -115,6 +117,7 @@ BM25_CANDIDATE_K = int_env("BM25_CANDIDATE_K", 30)
 # Book limits
 MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
 MAX_PDF_MB = int_env("MAX_PDF_MB", 80)
+MAX_VISUAL_PAGES = int_env("MAX_VISUAL_PAGES", 1)
 
 # Embeddings (OpenAI)
 EMBED_MODEL_NAME = "text-embedding-3-small"  # small + cheap + good enough
@@ -279,6 +282,7 @@ def book_paths(book_id: str, create: bool = True) -> Dict[str, Path]:
         "bm25": d / "bm25.sqlite",
         "emb": d / "embeddings.npy",
         "faiss": d / "index.faiss",
+        "pdf": d / "source.pdf",
     }
 
 
@@ -498,17 +502,25 @@ def build_faiss_ip_index(embs: np.ndarray):
     return idx
 
 
-def llm_generate(prompt: str) -> Tuple[str, Dict[str, int]]:
+def llm_generate(prompt: str, images: Optional[List[Tuple[int, bytes]]] = None) -> Tuple[str, Dict[str, int]]:
     """
     Calls OpenAI and returns (answer_text, usage_dict).
     """
     try:
         client = get_openai_client()
-        resp = client.responses.create(
-            model="gpt-5-mini",
-            input=prompt,
-            timeout=60,
-        )
+        if images:
+            content = [{"type": "input_text", "text": prompt}]
+            for page_number, png in images:
+                content.append({"type": "input_text", "text": f"Rendered PDF page {page_number} (cropped section):"})
+                content.append({
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                    "detail": "high",
+                })
+            model_input = [{"role": "user", "content": content}]
+        else:
+            model_input = prompt
+        resp = client.responses.create(model="gpt-5-mini", input=model_input, timeout=90 if images else 60)
 
         text = (resp.output_text or "").strip()
 
@@ -590,6 +602,67 @@ STUDENT QUESTION:
 
 Answer:
 """.strip()
+
+
+def wants_visual_connections(question: str) -> bool:
+    """Only inspect PDF pixels when the user asks about visual schedule links."""
+    return bool(re.search(r"\b(arrow|arrows|connector|connectors|dependency|dependencies|predecessor|predecessors|flowchart|diagram|interdependencies)\b", question, re.I))
+
+
+def visual_pages(book: BookIndex, question: str, hits: List[Tuple[Chunk, float]]) -> List[int]:
+    explicit = extract_page_filter(question)
+    if explicit is not None:
+        return [explicit] if 1 <= explicit <= book.page_total else []
+
+    # Prefer a page headed "Gantt Chart" over a textual task listing. The
+    # retrieved pages remain candidates for other kinds of diagrams.
+    candidates = set(ch.page_pdf for ch, _ in hits)
+    candidates.update(ch.page_pdf for ch in book.chunks if "gantt chart" in ch.text.lower())
+    ranked = sorted(candidates, key=lambda p: (
+        max((ch.text.lower().count("gantt chart") for ch in book.chunks if ch.page_pdf == p), default=0),
+        sum(ch.page_pdf == p for ch, _ in hits),
+    ), reverse=True)
+    return ranked[:MAX_VISUAL_PAGES]
+
+
+def render_visual_page(pdf_path: Path, page_number: int) -> List[bytes]:
+    """Trim empty margins and split tall charts into readable, overlapping images."""
+    import fitz  # PyMuPDF
+    from PIL import Image
+
+    with fitz.open(str(pdf_path)) as doc:
+        page = doc[page_number - 1]
+        # Bound raster memory for unusually large PDF page dimensions.
+        scale = min(250 / 72, 4000 / max(page.rect.width, page.rect.height),
+                    (10_000_000 / (page.rect.width * page.rect.height)) ** 0.5)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY, alpha=False)
+        image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+
+    # Ignore the running header when locating the document's main content.
+    top = int(image.height * 0.10)
+    ink = image.crop((0, top, image.width, image.height)).point(lambda x: 255 if x < 210 else 0)
+    bbox = ink.getbbox()
+    if bbox:
+        left, upper, right, lower = bbox
+        margin = 25
+        image = image.crop((max(0, left - margin), max(0, top + upper - margin),
+                            min(image.width, right + margin), min(image.height, top + lower + margin)))
+
+    # Each piece retains its row labels and bars. An overly tall one-page
+    # timeline would otherwise be shrunk until arrows become invisible.
+    max_height = 1600
+    step = 1450
+    parts = []
+    for y in range(0, image.height, step):
+        piece = image.crop((0, y, image.width, min(image.height, y + max_height)))
+        if piece.width > 2200:
+            piece.thumbnail((2200, max_height))
+        output = io.BytesIO()
+        piece.save(output, format="PNG", optimize=True)
+        parts.append(output.getvalue())
+        if y + max_height >= image.height:
+            break
+    return parts[:3]
 
 def keyword_bonus(query: str, text: str) -> float:
     q = query.lower()
@@ -2069,7 +2142,11 @@ async def upload(
             ))
 
     if not chunks:
-        raise HTTPException(status_code=400, detail="No extractable text found. If this PDF is scanned, you’ll need OCR.")
+        # Image-only diagrams can still be inspected on demand. This marker
+        # makes the document selectable without pretending OCR was performed.
+        chunks = [Chunk(book_id=book_id, page_pdf=p + 1, page_total=num_pages,
+                        text="Visual-only PDF page; ask about a specific page to inspect it.")
+                  for p in range(num_pages)]
 
     texts = [c.text for c in chunks]
 
@@ -2099,6 +2176,11 @@ async def upload(
 
     book.embeddings = embs
     save_book_to_disk(book)
+    # Keep the original pages for visual questions in later sessions/restarts.
+    pdf_path = book_paths(book_id)["pdf"]
+    temporary_pdf = pdf_path.with_suffix(".pdf.tmp")
+    temporary_pdf.write_bytes(pdf_bytes)
+    temporary_pdf.replace(pdf_path)
     book.embeddings = None
 
     logger.info("Upload finished for user_id=%s book_id=%s", user["id"], book_id)
@@ -2211,7 +2293,30 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
         hits = retrieve(book, normalized_question, TOP_K)
 
     prompt = build_prompt(question, hits, history)
-    answer, usage = llm_generate(prompt)
+    images = []
+    source_pdf = book_paths(book_id, create=False)["pdf"]
+    if wants_visual_connections(question) and source_pdf.exists():
+        pages = visual_pages(book, question, hits)
+        for page_number in pages:
+            try:
+                images.extend((page_number, png) for png in render_visual_page(source_pdf, page_number))
+            except Exception as e:
+                logger.warning("Could not render PDF page %s for book %s: %s", page_number, book_id, repr(e))
+        if images:
+            prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
+            prompt += """
+
+The attached images are rendered crops of the PDF pages named above, in page order.
+For every claimed arrow connection, name its source task and destination task,
+the page, and what visible line/arrowhead establishes its direction. Separate
+those directly visible links from plausible date-based inferences. A row being
+earlier, adjacent, or nested does NOT by itself prove a dependency. If labels,
+arrowheads, or endpoints are too small, crossing, or ambiguous, say so; do not
+invent a formal predecessor. Do not claim to have seen pages that were not attached.
+"""
+    elif wants_visual_connections(question):
+        prompt += "\n\nNo PDF page image was provided for visual inspection. You have text only. Do not claim to see arrows or offer image upload: this interface accepts PDFs. If the PDF was uploaded before visual support was added, ask for a PDF re-upload."
+    answer, usage = llm_generate(prompt, images or None)
     citations = format_citations(hits, answer)
 
     history.append({"role": "user", "content": question})
