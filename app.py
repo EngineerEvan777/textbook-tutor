@@ -1700,7 +1700,7 @@ function restore(){
 /* -------------------------
    Books / usage
 -------------------------- */
-async function refreshBooks() {
+async function refreshBooks(preferredBookId = null) {
   const btn = $("refreshBtn");
   btn.disabled = true;
   btn.textContent = "Refreshing…";
@@ -1715,7 +1715,7 @@ async function refreshBooks() {
     }
 
     const sel = $("bookSelect");
-    const prev = localStorage.getItem("tt_book_id") || sel.value;
+    const prev = preferredBookId || localStorage.getItem("tt_book_id") || sel.value;
 
     sel.innerHTML = '';
     const books = (data.books || []);
@@ -1734,7 +1734,7 @@ async function refreshBooks() {
     books.forEach(b => {
       const opt = document.createElement('option');
       opt.value = b.book_id;
-      opt.textContent = `${b.title} (${b.page_total} pages)`;
+      opt.textContent = `${b.title} (${b.page_total} pages)${b.visual_ready ? '' : ' — re-upload for diagrams'}`;
       sel.appendChild(opt);
     });
 
@@ -1915,7 +1915,7 @@ async function upload() {
       `Uploaded: ${data.title} • ${data.page_total} pages • ${data.num_chunks} chunks (in ${secs}s)`;
 
     toast("ok", "Upload complete", `Indexed “${data.title}” in ${secs}s.`);
-    await refreshBooks();
+    await refreshBooks(data.book_id);
     collapseSetupIfReady();
   } catch(e){
     $("uploadStatus").textContent = "Error: " + String(e);
@@ -2030,6 +2030,7 @@ def list_books(authorization: Optional[str] = Header(default=None)):
             "title": b.title,
             "page_total": b.page_total,
             "num_chunks": len(b.chunks),
+            "visual_ready": book_paths(b.book_id, create=False)["pdf"].is_file(),
         })
     out.sort(key=lambda x: x["title"].lower())
     return {"books": out}
@@ -2295,16 +2296,20 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
     prompt = build_prompt(question, hits, history)
     images = []
     source_pdf = book_paths(book_id, create=False)["pdf"]
-    if wants_visual_connections(question) and source_pdf.exists():
+    if wants_visual_connections(question):
+        if not source_pdf.is_file():
+            raise HTTPException(status_code=409, detail="This PDF was uploaded before visual analysis was added (or its original pages are missing). Re-upload the PDF, then select the newly uploaded book before asking about arrows.")
         pages = visual_pages(book, question, hits)
+        if not pages:
+            raise HTTPException(status_code=400, detail="That PDF page number is out of range. Ask about a page shown in the uploaded PDF.")
         for page_number in pages:
             try:
                 images.extend((page_number, png) for png in render_visual_page(source_pdf, page_number))
             except Exception as e:
                 logger.warning("Could not render PDF page %s for book %s: %s", page_number, book_id, repr(e))
-        if images:
-            prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
-            prompt += """
+                raise HTTPException(status_code=503, detail="Visual PDF rendering failed. Check that PyMuPDF and Pillow are installed and inspect the server logs.") from e
+        prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
+        prompt += """
 
 The attached images are rendered crops of the PDF pages named above, in page order.
 For every claimed arrow connection, name its source task and destination task,
@@ -2314,8 +2319,6 @@ earlier, adjacent, or nested does NOT by itself prove a dependency. If labels,
 arrowheads, or endpoints are too small, crossing, or ambiguous, say so; do not
 invent a formal predecessor. Do not claim to have seen pages that were not attached.
 """
-    elif wants_visual_connections(question):
-        prompt += "\n\nNo PDF page image was provided for visual inspection. You have text only. Do not claim to see arrows or offer image upload: this interface accepts PDFs. If the PDF was uploaded before visual support was added, ask for a PDF re-upload."
     answer, usage = llm_generate(prompt, images or None)
     citations = format_citations(hits, answer)
 
