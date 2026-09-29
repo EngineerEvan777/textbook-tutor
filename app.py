@@ -116,7 +116,7 @@ BM25_CANDIDATE_K = int_env("BM25_CANDIDATE_K", 30)
 
 # Book limits
 MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
-MAX_PDF_MB = int_env("MAX_PDF_MB", 80)
+MAX_PDF_MB = int_env("MAX_PDF_MB", 150)
 MAX_VISUAL_PAGES = int_env("MAX_VISUAL_PAGES", 1)
 
 # Embeddings (OpenAI)
