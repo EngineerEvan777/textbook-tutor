@@ -118,6 +118,7 @@ BM25_CANDIDATE_K = int_env("BM25_CANDIDATE_K", 30)
 MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
 MAX_PDF_MB = int_env("MAX_PDF_MB", 150)
 MAX_VISUAL_PAGES = int_env("MAX_VISUAL_PAGES", 1)
+MAX_CHAT_IMAGE_MB = int_env("MAX_CHAT_IMAGE_MB", 10)
 
 # Embeddings (OpenAI)
 EMBED_MODEL_NAME = "text-embedding-3-small"  # small + cheap + good enough
@@ -510,11 +511,15 @@ def llm_generate(prompt: str, images: Optional[List[Tuple[int, bytes]]] = None) 
         client = get_openai_client()
         if images:
             content = [{"type": "input_text", "text": prompt}]
-            for page_number, png in images:
-                content.append({"type": "input_text", "text": f"Rendered PDF page {page_number} (cropped section):"})
+            for image_label, image_bytes in images:
+                if isinstance(image_label, int):
+                    label = f"Rendered PDF page {image_label} (cropped section):"
+                else:
+                    label = str(image_label)
+                content.append({"type": "input_text", "text": label})
                 content.append({
                     "type": "input_image",
-                    "image_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii"),
                     "detail": "high",
                 })
             model_input = [{"role": "user", "content": content}]
@@ -586,7 +591,9 @@ You are a helpful textbook office-hours tutor.
 
 Rules:
 - Use ONLY the provided textbook context to answer factual textbook questions.
-- If the context is insufficient, say what is missing and ask a targeted follow-up question.
+- If the context is insufficient, say that the retrieved context is insufficient; do NOT claim that something is absent from the full PDF unless the application explicitly verified that.
+- If the student asks whether a numbered problem/exercise exists, prioritize the exact numbered match and its nearby page context.
+- If an attached student screenshot is present, use it as additional source material and describe what is actually visible.
 - Explain clearly and step-by-step when helpful.
 - ALWAYS include citations in-line like [p. 73 of 1062] for key claims.
 - Do NOT invent equations, figures, or page references.
@@ -823,6 +830,76 @@ def retrieve_faiss(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk,
 
     rescored.sort(key=lambda x: x[1], reverse=True)
     return rescored[:top_k]
+
+
+
+def extract_problem_reference(question: str) -> Optional[str]:
+    """Return a referenced exercise/problem number such as 4.2 or 12.17."""
+    patterns = [
+        r"\b(?:problem|exercise|question)\s*#?\s*(\d+(?:\.\d+)+)\b",
+        r"\b(?:prob|ex)\.?\s*#?\s*(\d+(?:\.\d+)+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, question, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def retrieve_problem_reference(book: BookIndex, question: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    """
+    Prefer literal problem/exercise-number matches before semantic/BM25 retrieval.
+    This prevents a query for Problem 4.2 from being answered from nearby 4.5-4.9
+    simply because those chunks otherwise rank well.
+    """
+    ref = extract_problem_reference(question)
+    if not ref:
+        return []
+
+    ref_re = re.escape(ref)
+    strong = re.compile(
+        rf"\b(?:problem|exercise|question)\s*#?\s*{ref_re}\b",
+        flags=re.IGNORECASE,
+    )
+    loose = re.compile(rf"(?<![\d.]){ref_re}(?![\d.])", flags=re.IGNORECASE)
+
+    strong_hits = [c for c in book.chunks if strong.search(c.text)]
+    matched = strong_hits or [c for c in book.chunks if loose.search(c.text)]
+    if not matched:
+        return []
+
+    pages = sorted({c.page_pdf for c in matched})
+    expanded_pages = set()
+    for p in pages:
+        expanded_pages.update(x for x in (p - 1, p, p + 1) if 1 <= x <= book.page_total)
+
+    ranked = sorted(
+        (c for c in book.chunks if c.page_pdf in expanded_pages),
+        key=lambda c: (
+            0 if strong.search(c.text) else 1 if loose.search(c.text) else 2,
+            abs(c.page_pdf - pages[0]),
+            c.page_pdf,
+        ),
+    )
+    return [(c, 10.0 if strong.search(c.text) else 8.0 if loose.search(c.text) else 1.0)
+            for c in ranked[:top_k]]
+
+
+def problem_reference_pages(book: BookIndex, question: str) -> List[int]:
+    """Find PDF pages whose extracted text contains the requested problem number."""
+    ref = extract_problem_reference(question)
+    if not ref:
+        return []
+    ref_re = re.escape(ref)
+    strong = re.compile(
+        rf"\b(?:problem|exercise|question)\s*#?\s*{ref_re}\b",
+        flags=re.IGNORECASE,
+    )
+    loose = re.compile(rf"(?<![\d.]){ref_re}(?![\d.])", flags=re.IGNORECASE)
+    strong_pages = sorted({c.page_pdf for c in book.chunks if strong.search(c.text)})
+    if strong_pages:
+        return strong_pages
+    return sorted({c.page_pdf for c in book.chunks if loose.search(c.text)})
 
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
@@ -1130,6 +1207,28 @@ def home():
       font-size: 12px;
       padding: 0 16px 14px;
     }
+    .attachmentRow{
+      display:none;
+      align-items:center;
+      gap:10px;
+      margin: 0 14px 10px;
+      padding:10px;
+      border:1px solid var(--border);
+      border-radius:12px;
+      background:#f9fafb;
+    }
+    .attachmentRow img{
+      width:72px;
+      height:72px;
+      object-fit:cover;
+      border-radius:10px;
+      border:1px solid var(--border);
+    }
+    .inputBar.dragover{
+      background:#eef4ff;
+      outline:2px dashed rgba(37,99,235,.45);
+      outline-offset:-4px;
+    }
 
     /* Toast */
     .toast{
@@ -1291,12 +1390,24 @@ def home():
 
         <div id="chat" class="chat"></div>
 
-        <div class="inputBar">
+        <div id="attachmentRow" class="attachmentRow">
+          <img id="attachmentPreview" alt="Screenshot preview" />
+          <div style="flex:1; min-width:0;">
+            <div id="attachmentName" style="font-weight:700; overflow:hidden; text-overflow:ellipsis;"></div>
+            <div class="muted">Screenshot attached to your next question.</div>
+          </div>
+          <button class="secondary" type="button" onclick="clearChatImage()">Remove</button>
+        </div>
+
+        <input type="file" id="chatImage" accept="image/png,image/jpeg,image/webp" style="display:none;" />
+
+        <div class="inputBar" id="inputBar">
+          <button class="secondary" type="button" id="attachBtn" onclick="$('chatImage').click()" title="Attach a screenshot or image">📎 Image</button>
           <textarea id="q" placeholder="Ask anything like office hours..."></textarea>
           <button id="askBtn" onclick="ask()">Ask</button>
         </div>
 
-        <div class="kbdHelp">Press Enter to send • Shift+Enter for a new line</div>
+        <div class="kbdHelp">Press Enter to send • Shift+Enter for a new line • Paste (Ctrl+V), drag & drop, or attach a screenshot</div>
       </div>
     </div>
   </div>
@@ -1972,16 +2083,80 @@ function setAskingState(isAsking) {
   $("askBtn").textContent = isAsking ? "Asking…" : "Ask";
 }
 
+let pendingChatImage = null;
+
+function clearChatImage() {
+  pendingChatImage = null;
+  $("chatImage").value = "";
+  $("attachmentPreview").removeAttribute("src");
+  $("attachmentName").textContent = "";
+  $("attachmentRow").style.display = "none";
+}
+
+function setChatImage(file) {
+  if (!file) return;
+  const allowed = ["image/png", "image/jpeg", "image/webp"];
+  if (!allowed.includes(file.type)) {
+    toast("bad", "Unsupported image", "Please use a PNG, JPG/JPEG, or WebP image.");
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    toast("bad", "Image too large", "Please keep screenshots under 10 MB.");
+    return;
+  }
+
+  pendingChatImage = file;
+  $("attachmentName").textContent = file.name || "Pasted screenshot";
+  $("attachmentPreview").src = URL.createObjectURL(file);
+  $("attachmentRow").style.display = "flex";
+}
+
+$("chatImage").addEventListener("change", function() {
+  setChatImage(this.files && this.files[0]);
+});
+
+$("q").addEventListener("paste", function(e) {
+  const items = Array.from(e.clipboardData?.items || []);
+  const imageItem = items.find(item => item.kind === "file" && item.type.startsWith("image/"));
+  if (!imageItem) return;
+  const file = imageItem.getAsFile();
+  if (file) {
+    e.preventDefault();
+    const named = new File([file], "pasted-screenshot.png", {type: file.type || "image/png"});
+    setChatImage(named);
+    toast("ok", "Screenshot attached", "Add a question, then click Ask.");
+  }
+});
+
+const inputBar = $("inputBar");
+["dragenter", "dragover"].forEach(eventName => {
+  inputBar.addEventListener(eventName, e => {
+    e.preventDefault();
+    inputBar.classList.add("dragover");
+  });
+});
+["dragleave", "drop"].forEach(eventName => {
+  inputBar.addEventListener(eventName, e => {
+    e.preventDefault();
+    inputBar.classList.remove("dragover");
+  });
+});
+inputBar.addEventListener("drop", e => {
+  const file = Array.from(e.dataTransfer?.files || []).find(f => f.type.startsWith("image/"));
+  if (file) setChatImage(file);
+});
+
 async function ask() {
   if (!(await requireLogin())) return;
 
   const book_id = $("bookSelect").value;
   const session_id = $("sessionId").value.trim();
-  const question = $("q").value.trim();
+  let question = $("q").value.trim();
 
   if (!book_id) { toast("bad", "Pick a book first", "Upload/select a book before asking."); return; }
   if (!session_id) { toast("bad", "Missing session ID", "Click “New session” to generate one."); return; }
-  if (!question) return;
+  if (!question && !pendingChatImage) return;
+  if (!question && pendingChatImage) question = "Please explain the attached screenshot using the selected textbook when relevant.";
 
   persist();
 
@@ -1991,12 +2166,23 @@ async function ask() {
   setAskingState(true);
 
   try{
-    const headers = await authHeaders({'Content-Type':'application/json'});
-    const r = await fetch('/chat', {
-      method:'POST',
-      headers,
-      body: JSON.stringify({book_id, session_id, question})
-    });
+    let r;
+    if (pendingChatImage) {
+      const fd = new FormData();
+      fd.append("book_id", book_id);
+      fd.append("session_id", session_id);
+      fd.append("question", question);
+      fd.append("image", pendingChatImage);
+      const headers = await authHeaders();
+      r = await fetch('/chat-with-image', {method:'POST', headers, body:fd});
+    } else {
+      const headers = await authHeaders({'Content-Type':'application/json'});
+      r = await fetch('/chat', {
+        method:'POST',
+        headers,
+        body: JSON.stringify({book_id, session_id, question})
+      });
+    }
     const data = await r.json();
     setAskingState(false);
 
@@ -2008,6 +2194,7 @@ async function ask() {
 
     addMessage('assistant', data.answer || '(no answer)');
     addMeta('CITATIONS: ' + (data.citations || '(none)'));
+    clearChatImage();
 
     if (data.usage) {
       const total = (data.usage.total_tokens || 0).toLocaleString();
@@ -2289,23 +2476,21 @@ def log_asked_question(user: Dict[str, str], question: str, authorization: Optio
     except Exception as e:
         logger.warning("Failed to log question: %s", repr(e))
 
-@app.post("/chat")
-def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
-
-    book_id = (payload.get("book_id") or "").strip()
-    session_id = (payload.get("session_id") or "").strip()
-    question = (payload.get("question") or "").strip()
-
+def process_chat_request(
+    user: Dict[str, str],
+    book_id: str,
+    session_id: str,
+    question: str,
+    authorization: Optional[str],
+    uploaded_image: Optional[bytes] = None,
+) -> Dict:
     if len(question) > 4000:
         raise HTTPException(status_code=400, detail="Question too long (max 4000 chars).")
-
     if len(question) < 2:
         raise HTTPException(status_code=400, detail="Please type a longer question.")
 
     if not book_id or book_id not in BOOKS:
         raise HTTPException(status_code=400, detail="Invalid or missing book_id.")
-
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session_id.")
 
@@ -2321,32 +2506,74 @@ def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=
         history = load_session_from_disk(user["id"], session_id)
 
     normalized_question = normalize_query(question)
-
     page_filter = extract_page_filter(question)
+
     if page_filter:
         filtered = [(c, 1.0) for c in book.chunks if c.page_pdf == page_filter]
         hits = filtered[:TOP_K]
     else:
-        hits = retrieve(book, normalized_question, TOP_K)
+        # Exact numbered problems/exercises take precedence over generic retrieval.
+        hits = retrieve_problem_reference(book, question, TOP_K)
+        if not hits:
+            hits = retrieve(book, normalized_question, TOP_K)
 
     prompt = build_prompt(question, hits, history)
     images = []
-    source_pdf = book_paths(book_id, create=False)["pdf"]
-    if wants_visual_connections(question):
-        if not source_pdf.is_file():
-            raise HTTPException(status_code=409, detail="This PDF was uploaded before visual analysis was added (or its original pages are missing). Re-upload the PDF, then select the newly uploaded book before asking about arrows.")
-        pages = visual_pages(book, question, hits)
-        if not pages:
-            raise HTTPException(status_code=400, detail="That PDF page number is out of range. Ask about a page shown in the uploaded PDF.")
-        for page_number in pages:
-            try:
-                images.extend((page_number, png) for png in render_visual_page(source_pdf, page_number))
-            except Exception as e:
-                logger.warning("Could not render PDF page %s for book %s: %s", page_number, book_id, repr(e))
-                raise HTTPException(status_code=503, detail="Visual PDF rendering failed. Check that PyMuPDF and Pillow are installed and inspect the server logs.") from e
-        prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
+
+    if uploaded_image:
+        images.append(("Student-uploaded screenshot/image:", uploaded_image))
         prompt += """
 
+STUDENT IMAGE:
+The student attached a screenshot/image with this message. Inspect it directly.
+Use the selected textbook context when it helps explain or verify what is visible.
+Do not claim that text, equations, labels, or diagrams are visible unless you can
+actually read/see them in the attached image.
+"""
+
+    source_pdf = book_paths(book_id, create=False)["pdf"]
+
+    # For a direct "do you see Problem 4.2?"-style request, render the exact page
+    # too. This catches equations/figures that PDF text extraction may omit.
+    problem_pages = problem_reference_pages(book, question)
+    should_render_problem = bool(problem_pages) and bool(
+        re.search(r"\b(see|read|find|locate|show|problem|exercise|question)\b", question, re.I)
+    )
+
+    if wants_visual_connections(question) or should_render_problem:
+        if not source_pdf.is_file():
+            if wants_visual_connections(question):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The original PDF pages are unavailable for visual analysis. Re-upload the PDF and select the newly uploaded book."
+                )
+        else:
+            pages = problem_pages[:MAX_VISUAL_PAGES] if should_render_problem else visual_pages(book, question, hits)
+            if not pages and wants_visual_connections(question):
+                raise HTTPException(status_code=400, detail="That PDF page number is out of range. Ask about a page shown in the uploaded PDF.")
+
+            for page_number in pages:
+                try:
+                    images.extend((page_number, png) for png in render_visual_page(source_pdf, page_number))
+                except Exception as e:
+                    logger.warning("Could not render PDF page %s for book %s: %s", page_number, book_id, repr(e))
+                    if wants_visual_connections(question):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Visual PDF rendering failed. Check that PyMuPDF and Pillow are installed and inspect the server logs."
+                        ) from e
+
+            if pages:
+                prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
+                if should_render_problem:
+                    prompt += """
+The attached rendered PDF page was selected because its extracted text contains
+the exact numbered problem/exercise requested by the student. Inspect the page
+before saying whether the problem is present. Equations or diagrams may be
+visible in the page image even when text extraction is incomplete.
+"""
+                if wants_visual_connections(question):
+                    prompt += """
 The attached images are rendered crops of the PDF pages named above, in page order.
 For every claimed arrow connection, name its source task and destination task,
 the page, and what visible line/arrowhead establishes its direction. Separate
@@ -2355,6 +2582,7 @@ earlier, adjacent, or nested does NOT by itself prove a dependency. If labels,
 arrowheads, or endpoints are too small, crossing, or ambiguous, say so; do not
 invent a formal predecessor. Do not claim to have seen pages that were not attached.
 """
+
     answer, usage = llm_generate(prompt, images or None)
     citations = format_citations(hits, answer)
 
@@ -2383,3 +2611,64 @@ invent a formal predecessor. Do not claim to have seen pages that were not attac
         "book_id": book_id,
         "usage": usage,
     }
+
+
+@app.post("/chat")
+def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
+    return process_chat_request(
+        user=user,
+        book_id=(payload.get("book_id") or "").strip(),
+        session_id=(payload.get("session_id") or "").strip(),
+        question=(payload.get("question") or "").strip(),
+        authorization=authorization,
+    )
+
+
+@app.post("/chat-with-image")
+async def chat_with_image(
+    book_id: str = Form(...),
+    session_id: str = Form(...),
+    question: str = Form(...),
+    image: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = get_current_user(authorization)
+
+    content_type = (image.content_type or "").lower()
+    allowed = {"image/png", "image/jpeg", "image/webp"}
+    if content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Please attach a PNG, JPG/JPEG, or WebP image.")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The attached image is empty.")
+    if len(image_bytes) > MAX_CHAT_IMAGE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"Image too large (max {MAX_CHAT_IMAGE_MB} MB).")
+
+    # Pillow verifies that the bytes really are a supported image and normalizes
+    # JPEG/WebP to PNG for the OpenAI image input path.
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im.verify()
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            if im.width * im.height > 25_000_000:
+                raise HTTPException(status_code=400, detail="Image dimensions are too large.")
+            im = im.convert("RGB")
+            normalized = io.BytesIO()
+            im.save(normalized, format="PNG", optimize=True)
+            image_bytes = normalized.getvalue()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="The attached file could not be read as an image.")
+
+    return process_chat_request(
+        user=user,
+        book_id=book_id.strip(),
+        session_id=session_id.strip(),
+        question=question.strip(),
+        authorization=authorization,
+        uploaded_image=image_bytes,
+    )
