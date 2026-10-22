@@ -997,6 +997,74 @@ def problem_reference_pages(book: BookIndex, question: str) -> List[int]:
 
 
 
+def chapter_exercise_request(question: str) -> Optional[int]:
+    """Detect requests for a chapter's end-of-chapter review exercises."""
+    if not re.search(
+        r"checking\s+understanding|review\s+questions?|chapter\s+exercises?|"
+        r"end.of.chapter|practice\s+(?:problems?|questions?)|"
+        r"(?:find|locate|list|show|see)\s+(?:the\s+)?(?:questions?|exercises?|problems?)",
+        question, re.IGNORECASE,
+    ):
+        return None
+    match = re.search(r"\bchapter\s+(\d+)\b", question, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def chapter_exercise_pages(book: BookIndex, chapter: int) -> List[int]:
+    """Locate review-section pages within the chapter, not in another chapter."""
+    # Find chapter section headings on actual content pages. TOC entries are
+    # excluded by requiring section numbers at the start of a line.
+    chapter_heading = re.compile(
+        rf"(?m)^\s*{chapter}\.\d{{1,2}}\s+[A-Za-z]"
+    )
+    next_heading = re.compile(
+        rf"(?m)^\s*{chapter + 1}\.\d{{1,2}}\s+[A-Za-z]"
+    )
+    section_pages = sorted({
+        c.page_pdf for c in book.chunks if chapter_heading.search(c.text)
+    })
+    next_pages = sorted({
+        c.page_pdf for c in book.chunks if next_heading.search(c.text)
+    })
+    if not section_pages:
+        return []
+
+    # TOC entries can mimic headings, so favor the content-page cluster after
+    # the book's front matter, and bound the search by the next chapter.
+    start = next((p for p in section_pages if p > max(15, int(book.page_total * .02))), section_pages[0])
+    end = next((p for p in next_pages if p > start), min(book.page_total + 1, start + 100))
+    if end <= start:
+        return []
+
+    heading = re.compile(
+        r"\bchecking\s+understanding\b|\breview\s+questions?\b|"
+        r"\bend.of.chapter\s+(?:problems?|exercises?)\b",
+        re.IGNORECASE,
+    )
+    candidates = sorted({
+        c.page_pdf for c in book.chunks
+        if start <= c.page_pdf < end and heading.search(c.text)
+    })
+    if not candidates:
+        return []
+
+    # Chapter summaries can mention the section; favor the last matches
+    # and inspect a following page when the heading begins near a page end.
+    ordered = sorted(candidates, reverse=True)
+    pages = []
+    for p in ordered:
+        for candidate in (p, p + 1):
+            if candidate < end and candidate <= book.page_total and candidate not in pages:
+                pages.append(candidate)
+    return pages
+
+
+def chapter_page_hits(book: BookIndex, pages: List[int], top_k: int) -> List[Tuple[Chunk, float]]:
+    """Supply extracted text from the same pages being visually inspected."""
+    selected = set(pages)
+    return [(c, 5.0) for c in book.chunks if c.page_pdf in selected][:top_k]
+
+
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
     if USE_BM25_RETRIEVAL:
         hits = retrieve_bm25(book, query, top_k)
@@ -2603,6 +2671,11 @@ def process_chat_request(
     normalized_question = normalize_query(question)
     page_filter = extract_page_filter(question)
     problem_ref = extract_problem_reference(question)
+    exercise_chapter = chapter_exercise_request(question)
+    exercise_pages = (
+        chapter_exercise_pages(book, exercise_chapter)
+        if exercise_chapter is not None else []
+    )
 
     # Page references are treated as PDF page numbers.
     # Printed textbook page numbers need separate mapping.
@@ -2611,7 +2684,12 @@ def process_chat_request(
         and 1 <= page_filter <= book.page_total
     )
 
-    if problem_ref:
+    if exercise_chapter is not None and page_filter is None:
+        hits = chapter_page_hits(book, exercise_pages[:3], TOP_K)
+        if not hits:
+            hits = retrieve(book, normalized_question, TOP_K)
+
+    elif problem_ref:
         problem_hits = retrieve_problem_reference(
             book, question, TOP_K
         )
@@ -2679,8 +2757,9 @@ actually read/see them in the attached image.
     # even when text extraction cannot locate the exercise.
     has_problem_request = problem_ref is not None
     should_render_problem = has_problem_request
+    should_render_exercises = exercise_chapter is not None
 
-    if wants_visual_connections(question) or should_render_problem:
+    if wants_visual_connections(question) or should_render_problem or should_render_exercises:
         if not source_pdf.is_file():
             if wants_visual_connections(question):
                 raise HTTPException(
@@ -2691,7 +2770,9 @@ actually read/see them in the attached image.
                     ),
                 )
         else:
-            if should_render_problem:
+            if should_render_exercises and page_filter is None:
+                pages = exercise_pages[:MAX_VISUAL_PAGES]
+            elif should_render_problem:
                 if page_filter is not None:
                     # Verify the page the student actually named.
                     pages = (
@@ -2735,6 +2816,17 @@ actually read/see them in the attached image.
                         )
                     )
 
+                    if should_render_exercises:
+                        prompt += f"""
+CHAPTER EXERCISE VERIFICATION:
+The student requested the end-of-chapter exercises for Chapter {exercise_chapter}.
+The attached images are candidate pages, not proof of a match.
+Check for the actual "Checking Understanding" (or equivalent review)
+heading and exercise text on these pages. Cite only verified PDF pages.
+If only part of the section is visible, say so; do not claim to list
+all exercises. If the requested section is not visible, say it could
+not be verified. Never substitute exercises from another chapter.
+"""
                     if should_render_problem:
                         prompt += """
 PDF EXERCISE VERIFICATION:
@@ -2762,12 +2854,21 @@ For each claimed arrow connection, identify the
 source, destination, page, and visible arrow evidence.
 Do not invent connections that cannot be verified.
 """
-                elif should_render_problem:
+                elif should_render_problem or should_render_exercises:
                     prompt += """
 The requested PDF page could not be rendered.
 Do not claim to have visually verified the exercise.
 """
 
+
+    if should_render_exercises and not exercise_pages and page_filter is None:
+        prompt += f"""
+CHAPTER EXERCISE SEARCH:
+No chapter-specific review section could be located for Chapter {exercise_chapter}
+using extracted PDF text. The retrieved passages may discuss other chapters.
+Do not claim to have inspected or ruled out the full chapter's exercises.
+Ask for an exact PDF page or a screenshot if the student has one.
+"""
 
     answer, usage = llm_generate(prompt, images or None)
     citations = format_citations(hits, answer)
