@@ -834,16 +834,19 @@ def retrieve_faiss(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk,
 
 
 def extract_problem_reference(question: str) -> Optional[str]:
-    """Return a referenced exercise/problem number such as 4.2 or 12.17."""
+    """Return a referenced exercise/problem number, such as 1, 3.1, or 12.17."""
     patterns = [
-        r"\b(?:problem|exercise|question)\s*#?\s*(\d+(?:\.\d+)+)\b",
-        r"\b(?:prob|ex)\.?\s*#?\s*(\d+(?:\.\d+)+)\b",
+        r"\b(?:problem|exercise|question)\s*#?\s*(\d+(?:\.\d+)*)\b",
+        r"\b(?:prob|ex)\.?\s*#?\s*(\d+(?:\.\d+)*)\b",
     ]
+
     for pat in patterns:
         m = re.search(pat, question, flags=re.IGNORECASE)
         if m:
             return m.group(1)
+
     return None
+
 
 
 def retrieve_problem_reference(book: BookIndex, question: str, top_k: int) -> List[Tuple[Chunk, float]]:
@@ -856,50 +859,142 @@ def retrieve_problem_reference(book: BookIndex, question: str, top_k: int) -> Li
     if not ref:
         return []
 
+    
     ref_re = re.escape(ref)
+
+    # Explicit problem/exercise labels are the strongest evidence.
     strong = re.compile(
-        rf"\b(?:problem|exercise|question)\s*#?\s*{ref_re}\b",
+        rf"\b(?:problem|exercise|question|prob\.?|ex\.?)\s*#?\s*{ref_re}(?![\d.])",
         flags=re.IGNORECASE,
     )
-    loose = re.compile(rf"(?<![\d.]){ref_re}(?![\d.])", flags=re.IGNORECASE)
 
+    # Numbered exercises may begin with just "3.1" or "1."
+    # Require the number to appear at the start of a line.
+    heading = re.compile(
+        rf"(?m)^\s*{ref_re}\s*[.):]\s+(?=\S)",
+        flags=re.IGNORECASE,
+    )
+
+    # General mentions of the number are weaker evidence.
+    loose = re.compile(
+        rf"(?<![\d.]){ref_re}(?![\d.])",
+        flags=re.IGNORECASE,
+    )
+
+
+    
     strong_hits = [c for c in book.chunks if strong.search(c.text)]
-    matched = strong_hits or [c for c in book.chunks if loose.search(c.text)]
+    heading_hits = [c for c in book.chunks if heading.search(c.text)]
+
+    # Prefer explicitly labeled exercises, then numbered headings.
+    # Avoid unrestricted numeric matches for standalone numbers such as "1".
+    if strong_hits:
+        matched = strong_hits
+    elif heading_hits:
+        matched = heading_hits
+    elif "." in ref:
+        matched = [c for c in book.chunks if loose.search(c.text)]
+    else:
+        matched = []
+
     if not matched:
         return []
+
 
     pages = sorted({c.page_pdf for c in matched})
     expanded_pages = set()
     for p in pages:
         expanded_pages.update(x for x in (p - 1, p, p + 1) if 1 <= x <= book.page_total)
 
+    
     ranked = sorted(
         (c for c in book.chunks if c.page_pdf in expanded_pages),
         key=lambda c: (
-            0 if strong.search(c.text) else 1 if loose.search(c.text) else 2,
-            abs(c.page_pdf - pages[0]),
+            0 if strong.search(c.text)
+            else 1 if heading.search(c.text)
+            else 2 if "." in ref and loose.search(c.text)
+            else 3,
+            min(abs(c.page_pdf - p) for p in pages),
             c.page_pdf,
         ),
     )
-    return [(c, 10.0 if strong.search(c.text) else 8.0 if loose.search(c.text) else 1.0)
-            for c in ranked[:top_k]]
+
+    return [
+        (
+            c,
+            10.0 if strong.search(c.text)
+            else 9.0 if heading.search(c.text)
+            else 8.0 if "." in ref and loose.search(c.text)
+            else 1.0,
+        )
+        for c in ranked[:top_k]
+    ]
 
 
 def problem_reference_pages(book: BookIndex, question: str) -> List[int]:
-    """Find PDF pages whose extracted text contains the requested problem number."""
+    """Find candidate PDF pages for visual verification of a numbered exercise."""
     ref = extract_problem_reference(question)
     if not ref:
         return []
+
     ref_re = re.escape(ref)
-    strong = re.compile(
-        rf"\b(?:problem|exercise|question)\s*#?\s*{ref_re}\b",
-        flags=re.IGNORECASE,
+
+    explicit_label = re.compile(
+        rf"\b(?:problem|exercise|question|prob\.?|ex\.?)"
+        rf"\s*#?\s*{ref_re}(?![\d.])",
+        re.IGNORECASE,
     )
-    loose = re.compile(rf"(?<![\d.]){ref_re}(?![\d.])", flags=re.IGNORECASE)
-    strong_pages = sorted({c.page_pdf for c in book.chunks if strong.search(c.text)})
-    if strong_pages:
-        return strong_pages
-    return sorted({c.page_pdf for c in book.chunks if loose.search(c.text)})
+
+    numbered_heading = re.compile(
+        rf"(?m)^\s*{ref_re}\s*[.):]\s+(?=\S)",
+        re.IGNORECASE,
+    )
+
+    # Avoid accepting arbitrary occurrences of the number.
+    candidates = {}
+
+    for chunk in book.chunks:
+        text = chunk.text
+        if explicit_label.search(text):
+            score = 2
+        elif numbered_heading.search(text):
+            score = 1
+        else:
+            continue
+
+        page = chunk.page_pdf
+        candidates[page] = max(candidates.get(page, 0), score)
+
+    if not candidates:
+        return []
+
+    requested_page = extract_page_filter(question)
+
+    if requested_page is not None:
+        # When the user gives a PDF page, inspect nearby
+        # matching exercise pages first.
+        nearby = [
+            p for p in candidates
+            if abs(p - requested_page) <= 1
+        ]
+        if nearby:
+            return sorted(
+                nearby,
+                key=lambda p: (
+                    abs(p - requested_page),
+                    -candidates[p],
+                ),
+            )
+
+        # Do not substitute a distant matching exercise
+        # for the one requested on this page.
+        return []
+
+    return sorted(
+        candidates,
+        key=lambda p: (-candidates[p], p),
+    )
+
 
 
 def retrieve(book: BookIndex, query: str, top_k: int) -> List[Tuple[Chunk, float]]:
@@ -2504,18 +2599,60 @@ def process_chat_request(
     history = SESSIONS.get(cache_key)
     if history is None:
         history = load_session_from_disk(user["id"], session_id)
-
+    
     normalized_question = normalize_query(question)
     page_filter = extract_page_filter(question)
+    problem_ref = extract_problem_reference(question)
 
-    if page_filter:
-        filtered = [(c, 1.0) for c in book.chunks if c.page_pdf == page_filter]
-        hits = filtered[:TOP_K]
+    # Page references are treated as PDF page numbers.
+    # Printed textbook page numbers need separate mapping.
+    page_is_valid = (
+        page_filter is not None
+        and 1 <= page_filter <= book.page_total
+    )
+
+    if problem_ref:
+        problem_hits = retrieve_problem_reference(
+            book, question, TOP_K
+        )
+
+        if page_filter is not None:
+            # Do not use a distant matching exercise when
+            # the student specifies a particular page.
+            hits = [
+                (c, score)
+                for c, score in problem_hits
+                if page_is_valid
+                and abs(c.page_pdf - page_filter) <= 1
+            ]
+
+            if not hits and page_is_valid:
+                # Supply local context, but do not claim
+                # that it contains the requested exercise.
+                hits = [
+                    (c, 1.0)
+                    for c in book.chunks
+                    if abs(c.page_pdf - page_filter) <= 1
+                ][:TOP_K]
+        else:
+            hits = problem_hits
+
+            if not hits:
+                hits = retrieve(
+                    book, normalized_question, TOP_K
+                )
+
+    elif page_filter is not None:
+        hits = [
+            (c, 1.0)
+            for c in book.chunks
+            if page_is_valid and c.page_pdf == page_filter
+        ][:TOP_K]
+
     else:
-        # Exact numbered problems/exercises take precedence over generic retrieval.
-        hits = retrieve_problem_reference(book, question, TOP_K)
-        if not hits:
-            hits = retrieve(book, normalized_question, TOP_K)
+        hits = retrieve(book, normalized_question, TOP_K)
+
+
 
     prompt = build_prompt(question, hits, history)
     images = []
@@ -2535,53 +2672,102 @@ actually read/see them in the attached image.
 
     # For a direct "do you see Problem 4.2?"-style request, render the exact page
     # too. This catches equations/figures that PDF text extraction may omit.
+    
     problem_pages = problem_reference_pages(book, question)
-    should_render_problem = bool(problem_pages) and bool(
-        re.search(r"\b(see|read|find|locate|show|problem|exercise|question)\b", question, re.I)
-    )
+
+    # Explicit page references are useful for verification
+    # even when text extraction cannot locate the exercise.
+    has_problem_request = problem_ref is not None
+    should_render_problem = has_problem_request
 
     if wants_visual_connections(question) or should_render_problem:
         if not source_pdf.is_file():
             if wants_visual_connections(question):
                 raise HTTPException(
                     status_code=409,
-                    detail="The original PDF pages are unavailable for visual analysis. Re-upload the PDF and select the newly uploaded book."
+                    detail=(
+                        "The original PDF pages are unavailable "
+                        "for visual analysis. Re-upload the PDF."
+                    ),
                 )
         else:
-            pages = problem_pages[:MAX_VISUAL_PAGES] if should_render_problem else visual_pages(book, question, hits)
-            if not pages and wants_visual_connections(question):
-                raise HTTPException(status_code=400, detail="That PDF page number is out of range. Ask about a page shown in the uploaded PDF.")
-
-            for page_number in pages:
-                try:
-                    images.extend((page_number, png) for png in render_visual_page(source_pdf, page_number))
-                except Exception as e:
-                    logger.warning("Could not render PDF page %s for book %s: %s", page_number, book_id, repr(e))
-                    if wants_visual_connections(question):
-                        raise HTTPException(
-                            status_code=503,
-                            detail="Visual PDF rendering failed. Check that PyMuPDF and Pillow are installed and inspect the server logs."
-                        ) from e
-
+            if should_render_problem:
+                if page_filter is not None:
+                    # Verify the page the student actually named.
+                    pages = (
+                        [page_filter]
+                        if page_is_valid else []
+                    )
+                else:
+                    # Inspect the best candidate exercise pages.
+                    pages = problem_pages[:MAX_VISUAL_PAGES]
+            else:
+                pages = visual_pages(book, question, hits)            
+            
             if pages:
-                prompt += "\n\nVISUAL PDF PAGES: " + ", ".join(f"p. {p} of {book.page_total}" for p in pages)
-                if should_render_problem:
-                    prompt += """
-The attached rendered PDF page was selected because its extracted text contains
-the exact numbered problem/exercise requested by the student. Inspect the page
-before saying whether the problem is present. Equations or diagrams may be
-visible in the page image even when text extraction is incomplete.
+                rendered_pdf_images = []
+                rendered_pages = []
+
+                for page_number in pages[:MAX_VISUAL_PAGES]:
+                    try:
+                        rendered_parts = render_visual_page(
+                            source_pdf, page_number
+                        )
+                        for part in rendered_parts:
+                            rendered_pdf_images.append((page_number, part))
+                        if rendered_parts:
+                            rendered_pages.append(page_number)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not render PDF page %s: %s",
+                            page_number,
+                            repr(exc),
+                        )
+
+                images.extend(rendered_pdf_images)
+
+                if rendered_pdf_images:
+                    prompt += (
+                        "\n\nVISUAL PDF PAGES: "
+                        + ", ".join(
+                            f"p. {p} of {book.page_total}"
+                            for p in rendered_pages
+                        )
+                    )
+
+                    if should_render_problem:
+                        prompt += """
+PDF EXERCISE VERIFICATION:
+The attached images show candidate PDF pages for the
+student's requested exercise. Selection does not prove
+the exercise appears on those pages.
+
+Inspect the images and extracted text to verify:
+1. The exercise number matches the student's request.
+2. The content is an actual exercise, not a section
+   heading, table-of-contents entry, or equation number.
+3. The exercise statement is readable and complete.
+
+If the exercise cannot be verified, say so.
+Do not invent or substitute a different exercise.
+Ask for the correct PDF page or a screenshot if needed.
+
+PDF page numbers may differ from printed page numbers.
 """
-                if wants_visual_connections(question):
-                    prompt += """
-The attached images are rendered crops of the PDF pages named above, in page order.
-For every claimed arrow connection, name its source task and destination task,
-the page, and what visible line/arrowhead establishes its direction. Separate
-those directly visible links from plausible date-based inferences. A row being
-earlier, adjacent, or nested does NOT by itself prove a dependency. If labels,
-arrowheads, or endpoints are too small, crossing, or ambiguous, say so; do not
-invent a formal predecessor. Do not claim to have seen pages that were not attached.
+
+                    if wants_visual_connections(question):
+                        prompt += """
+The attached images are rendered PDF page crops.
+For each claimed arrow connection, identify the
+source, destination, page, and visible arrow evidence.
+Do not invent connections that cannot be verified.
 """
+                elif should_render_problem:
+                    prompt += """
+The requested PDF page could not be rendered.
+Do not claim to have visually verified the exercise.
+"""
+
 
     answer, usage = llm_generate(prompt, images or None)
     citations = format_citations(hits, answer)
