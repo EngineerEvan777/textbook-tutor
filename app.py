@@ -107,12 +107,13 @@ SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 # Retrieval params
 TOP_K = 6
-MAX_CONTEXT_CHARS = 12000
+MAX_CONTEXT_CHARS = 16000
 CHUNK_TARGET_CHARS = int_env("CHUNK_TARGET_CHARS", 1800)
 CHUNK_OVERLAP_CHARS = int_env("CHUNK_OVERLAP_CHARS", 100)
 MIN_CHUNK_CHARS = int_env("MIN_CHUNK_CHARS", 80)
 USE_BM25_RETRIEVAL = bool_env("USE_BM25_RETRIEVAL", True)
 BM25_CANDIDATE_K = int_env("BM25_CANDIDATE_K", 30)
+MAX_FORMULA_VISUAL_PAGES = int_env("MAX_FORMULA_VISUAL_PAGES", 2)
 
 # Book limits
 MAX_BOOKS_PER_USER = int(os.getenv("MAX_BOOKS_PER_USER", "3"))
@@ -674,6 +675,81 @@ def render_visual_page(pdf_path: Path, page_number: int) -> List[bytes]:
         if y + max_height >= image.height:
             break
     return parts[:3]
+
+def wants_formula(question: str) -> bool:
+    """Recognize requests for mathematical relationships, not just the word formula."""
+    return bool(re.search(
+        r"\b(formula|formulas|equation|equations|expression|expressions|"
+        r"derive|derivation|calculate|compute|coefficient|relationship|"
+        r"mathematical|symbolic)\b|\bhow (?:do|can) (?:i|we) (?:find|calculate|compute)\b",
+        question, re.IGNORECASE,
+    ))
+
+
+def formula_search_queries(question: str) -> List[str]:
+    """Run a few small lexical variants without assuming a particular subject."""
+    base = normalize_query(question)
+    queries = [base]
+    stripped = re.sub(
+        r"\b(can|could|you|give|me|the|a|an|from|this|pdf|textbook|book|"
+        r"what|is|are|please|show|find|formula|equation|for|of)\b",
+        " ", base, flags=re.IGNORECASE,
+    )
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if stripped and stripped.lower() != base.lower():
+        queries.append(stripped)
+    if re.search(r"\binduced[ -]+drag\b", base, re.I):
+        queries.extend(["induced drag coefficient", "drag due to lift", "span efficiency aspect ratio"])
+    return queries[:5]
+
+
+def is_reference_like(text: str) -> bool:
+    """Down-rank likely index/contents entries; do not categorically exclude them."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    index_signals = sum(bool(re.search(r"(?:\.{3,}|\s{2,})\s*\d{1,4}\s*$", line)) for line in lines)
+    index_signals += sum(bool(re.search(r"^[A-Za-z][^.!?]{2,65},\s*\d{1,4}(?:[,–-]\s*\d{1,4})*\s*$", line)) for line in lines)
+    return index_signals >= max(2, len(lines) // 4)
+
+
+def formula_page_candidates(book: BookIndex, question: str, hits: List[Tuple[Chunk, float]], limit: int) -> List[int]:
+    """Rank actual pages, not just chunks. Avoid index/TOC and diversify pages."""
+    scores: Dict[int, float] = {}
+    queries = formula_search_queries(question)
+    for query in queries:
+        # A wider pool is essential when index pages crowd the top results.
+        for rank, (chunk, _score) in enumerate(retrieve(book, query, 24)):
+            penalty = 0.12 if is_reference_like(chunk.text) else 1.0
+            scores[chunk.page_pdf] = scores.get(chunk.page_pdf, 0.0) + penalty * (1.0 / (1.0 + rank * 0.22))
+    for rank, (chunk, _score) in enumerate(hits):
+        scores[chunk.page_pdf] = scores.get(chunk.page_pdf, 0.0) + (0.15 if is_reference_like(chunk.text) else 0.8) / (1 + rank * 0.15)
+    # Don't select adjacent chunks from the same page more than once.
+    return [p for p, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def formula_context_hits(book: BookIndex, question: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    """Blend multiple lexical searches and favor substantive pages."""
+    candidates: Dict[Tuple[int, str], Tuple[Chunk, float]] = {}
+    for query in formula_search_queries(question):
+        for rank, (chunk, _score) in enumerate(retrieve(book, query, 24)):
+            key = (chunk.page_pdf, chunk.text)
+            score = (1.0 / (1.0 + rank * 0.2)) * (0.15 if is_reference_like(chunk.text) else 1.0)
+            if key not in candidates or score > candidates[key][1]:
+                candidates[key] = (chunk, score)
+    ordered = sorted(candidates.values(), key=lambda hit: hit[1], reverse=True)
+    selected = []
+    page_counts: Dict[int, int] = {}
+    for hit in ordered:
+        page = hit[0].page_pdf
+        if page_counts.get(page, 0) >= 2:
+            continue
+        selected.append(hit)
+        page_counts[page] = page_counts.get(page, 0) + 1
+        if len(selected) >= top_k:
+            break
+    return selected
+
 
 def keyword_bonus(query: str, text: str) -> float:
     q = query.lower()
@@ -2728,8 +2804,8 @@ def process_chat_request(
         ][:TOP_K]
 
     else:
-        hits = retrieve(book, normalized_question, TOP_K)
-
+        hits = (formula_context_hits(book, normalized_question, TOP_K)
+                if wants_formula(question) else retrieve(book, normalized_question, TOP_K))
 
 
     prompt = build_prompt(question, hits, history)
@@ -2758,8 +2834,9 @@ actually read/see them in the attached image.
     has_problem_request = problem_ref is not None
     should_render_problem = has_problem_request
     should_render_exercises = exercise_chapter is not None
+    should_render_formula = wants_formula(question) and not should_render_problem and not should_render_exercises
 
-    if wants_visual_connections(question) or should_render_problem or should_render_exercises:
+    if wants_visual_connections(question) or should_render_problem or should_render_exercises or should_render_formula:
         if not source_pdf.is_file():
             if wants_visual_connections(question):
                 raise HTTPException(
@@ -2782,6 +2859,9 @@ actually read/see them in the attached image.
                 else:
                     # Inspect the best candidate exercise pages.
                     pages = problem_pages[:MAX_VISUAL_PAGES]
+            elif should_render_formula:
+                pages = ([page_filter] if page_filter is not None and page_is_valid
+                         else formula_page_candidates(book, question, hits, MAX_FORMULA_VISUAL_PAGES))
             else:
                 pages = visual_pages(book, question, hits)            
             
@@ -2789,7 +2869,8 @@ actually read/see them in the attached image.
                 rendered_pdf_images = []
                 rendered_pages = []
 
-                for page_number in pages[:MAX_VISUAL_PAGES]:
+                page_limit = MAX_FORMULA_VISUAL_PAGES if should_render_formula else MAX_VISUAL_PAGES
+                for page_number in pages[:page_limit]:
                     try:
                         rendered_parts = render_visual_page(
                             source_pdf, page_number
@@ -2816,6 +2897,16 @@ actually read/see them in the attached image.
                         )
                     )
 
+                    if should_render_formula:
+                        prompt += """
+FORMULA VERIFICATION:
+These are candidate rendered pages from the uploaded PDF. Inspect them
+for the requested mathematical relationship. Transcribe equations only if
+legible and actually present. Cite the PDF page shown, not an index
+reference. If the equation cannot be verified, state that clearly.
+Do not use an equation from general knowledge as if it came from the book.
+Printed page numbers and PDF page numbers may differ.
+"""
                     if should_render_exercises:
                         prompt += f"""
 CHAPTER EXERCISE VERIFICATION:
@@ -2854,7 +2945,7 @@ For each claimed arrow connection, identify the
 source, destination, page, and visible arrow evidence.
 Do not invent connections that cannot be verified.
 """
-                elif should_render_problem or should_render_exercises:
+                elif should_render_problem or should_render_exercises or should_render_formula:
                     prompt += """
 The requested PDF page could not be rendered.
 Do not claim to have visually verified the exercise.
@@ -2870,8 +2961,15 @@ Do not claim to have inspected or ruled out the full chapter's exercises.
 Ask for an exact PDF page or a screenshot if the student has one.
 """
 
+    if should_render_formula and not source_pdf.is_file():
+        prompt += "\nThe original PDF is unavailable for visual verification. Do not claim visual inspection.\n"
+
     answer, usage = llm_generate(prompt, images or None)
-    citations = format_citations(hits, answer)
+    citation_hits = list(hits)
+    if source_pdf.is_file() and "rendered_pages" in locals():
+        for p in rendered_pages:
+            citation_hits.append((Chunk(book_id, p, book.page_total, "Visually inspected PDF page"), 0.0))
+    citations = format_citations(citation_hits, answer)
 
     history.append({"role": "user", "content": question})
     history.append({"role": "assistant", "content": answer})
