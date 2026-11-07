@@ -594,7 +594,7 @@ Rules:
 - Use ONLY the provided textbook context to answer factual textbook questions.
 - If the context is insufficient, say that the retrieved context is insufficient; do NOT claim that something is absent from the full PDF unless the application explicitly verified that.
 - If the student asks whether a numbered problem/exercise exists, prioritize the exact numbered match and its nearby page context.
-- If an attached student screenshot is present, use it as additional source material and describe what is actually visible.
+- Only say the student attached a screenshot if a STUDENT IMAGE block explicitly confirms an upload in THIS request. Rendered PDF page images are textbook content, never student screenshots. Previous conversation references to screenshots are not evidence of a new attachment.
 - Explain clearly and step-by-step when helpful.
 - ALWAYS include citations in-line like [p. 73 of 1062] for key claims.
 - Do NOT invent equations, figures, or page references.
@@ -923,6 +923,74 @@ def extract_problem_reference(question: str) -> Optional[str]:
 
     return None
 
+
+
+def extract_section_reference(question: str) -> Optional[str]:
+    """Recognize section references such as 'for 2.2', 'Section 2.2', 'in 2.2'."""
+    patterns = (
+        r"\b(?:section|sec\.?)\s*(\d{1,2}\.\d{1,2})\b",
+        r"\b(?:for|from|in|of)\s+(?:section\s+)?(\d{1,2}\.\d{1,2})\b",
+        r"\b(\d{1,2}\.\d{1,2})\s+[A-Za-z][A-Za-z -]{2,}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, question, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def section_page_range(book: BookIndex, section: str) -> List[int]:
+    """Locate the content-page range for a textbook section using page headers.
+
+    Require a section heading near the beginning of a PDF page; a TOC mention
+    or a cross-reference in body text must not determine the section boundary.
+    """
+    heading = re.compile(rf"(?m)^\s*{re.escape(section)}\s*\n\s*[A-Za-z]", re.I)
+    heading_same_line = re.compile(rf"(?m)^\s*{re.escape(section)}\s+[A-Za-z]", re.I)
+    headings = {}
+    for chunk in book.chunks:
+        beginning = chunk.text[:450]
+        if heading.search(beginning) or heading_same_line.search(beginning):
+            headings.setdefault(chunk.page_pdf, True)
+    pages = sorted(headings)
+    if not pages:
+        return []
+    # Ignore front-matter TOC entries; section header is repeated on content pages.
+    minimum = max(25, int(book.page_total * 0.04))
+    pages = [p for p in pages if p > minimum]
+    if not pages:
+        return []
+    start = pages[0]
+    # A section often has alternating running headers, so find the next section
+    # heading on or after the last identified page.
+    major, minor = map(int, section.split('.'))
+    next_section = f"{major}.{minor + 1}"
+    next_re = re.compile(rf"(?m)^\s*{re.escape(next_section)}\s*(?:\n\s*| +)[A-Za-z]", re.I)
+    next_pages = sorted({c.page_pdf for c in book.chunks
+                         if c.page_pdf > start and next_re.search(c.text[:450])})
+    end = next_pages[0] if next_pages else min(book.page_total + 1, max(pages) + 3)
+    return list(range(start, min(end, book.page_total + 1)))
+
+
+def section_problem_pages(book: BookIndex, section: str, ref: str) -> List[int]:
+    """Prioritize numbered exercises in the PROBLEMS block of the right section."""
+    pages = section_page_range(book, section)
+    if not pages:
+        return []
+    number = re.escape(ref)
+    exercise = re.compile(rf"(?m)^\s*{number}\s*[.):]\s*(?=\S)", re.I)
+    results = []
+    in_problems = False
+    for page in pages:
+        chunks = [c.text for c in book.chunks if c.page_pdf == page]
+        full = "\n".join(chunks)
+        block = re.search(r"(?m)^\s*PROBLEMS\s*$", full, re.I)
+        if block:
+            in_problems = True
+            full = full[block.end():]
+        if in_problems and exercise.search(full):
+            results.append(page)
+    return results
 
 
 def retrieve_problem_reference(book: BookIndex, question: str, top_k: int) -> List[Tuple[Chunk, float]]:
@@ -2747,6 +2815,7 @@ def process_chat_request(
     normalized_question = normalize_query(question)
     page_filter = extract_page_filter(question)
     problem_ref = extract_problem_reference(question)
+    section_ref = extract_section_reference(question)
     exercise_chapter = chapter_exercise_request(question)
     exercise_pages = (
         chapter_exercise_pages(book, exercise_chapter)
@@ -2766,11 +2835,22 @@ def process_chat_request(
             hits = retrieve(book, normalized_question, TOP_K)
 
     elif problem_ref:
+        scoped_pages = (section_problem_pages(book, section_ref, problem_ref)
+                        if section_ref else [])
         problem_hits = retrieve_problem_reference(
             book, question, TOP_K
         )
 
-        if page_filter is not None:
+        if section_ref and page_filter is None:
+            # A numbered exercise is only meaningful inside its specified section.
+            # Never fall back to an exercise from a different section.
+            hits = [(c, 10.0) for c in book.chunks
+                    if c.page_pdf in scoped_pages][:TOP_K]
+            if not hits:
+                local_pages = section_page_range(book, section_ref)
+                hits = [(c, 1.0) for c in book.chunks
+                        if c.page_pdf in local_pages][:TOP_K]
+        elif page_filter is not None:
             # Do not use a distant matching exercise when
             # the student specifies a particular page.
             hits = [
@@ -2827,7 +2907,8 @@ actually read/see them in the attached image.
     # For a direct "do you see Problem 4.2?"-style request, render the exact page
     # too. This catches equations/figures that PDF text extraction may omit.
     
-    problem_pages = problem_reference_pages(book, question)
+    problem_pages = (scoped_pages if problem_ref and section_ref
+                     else problem_reference_pages(book, question))
 
     # Explicit page references are useful for verification
     # even when text extraction cannot locate the exercise.
@@ -2859,6 +2940,9 @@ actually read/see them in the attached image.
                 else:
                     # Inspect the best candidate exercise pages.
                     pages = problem_pages[:MAX_VISUAL_PAGES]
+                    if not pages and section_ref:
+                        # Inspect section-local pages, never unrelated exercise 1 pages.
+                        pages = section_page_range(book, section_ref)[-MAX_VISUAL_PAGES:]
             elif should_render_formula:
                 pages = ([page_filter] if page_filter is not None and page_is_valid
                          else formula_page_candidates(book, question, hits, MAX_FORMULA_VISUAL_PAGES))
@@ -2911,7 +2995,7 @@ Printed page numbers and PDF page numbers may differ.
                         prompt += f"""
 CHAPTER EXERCISE VERIFICATION:
 The student requested the end-of-chapter exercises for Chapter {exercise_chapter}.
-The attached images are candidate pages, not proof of a match.
+The rendered textbook PDF images are candidate pages, not proof of a match.
 Check for the actual "Checking Understanding" (or equivalent review)
 heading and exercise text on these pages. Cite only verified PDF pages.
 If only part of the section is visible, say so; do not claim to list
@@ -2921,7 +3005,7 @@ not be verified. Never substitute exercises from another chapter.
                     if should_render_problem:
                         prompt += """
 PDF EXERCISE VERIFICATION:
-The attached images show candidate PDF pages for the
+The rendered textbook PDF images show candidate pages for the
 student's requested exercise. Selection does not prove
 the exercise appears on those pages.
 
@@ -2940,7 +3024,7 @@ PDF page numbers may differ from printed page numbers.
 
                     if wants_visual_connections(question):
                         prompt += """
-The attached images are rendered PDF page crops.
+These images are rendered textbook PDF page crops, not student uploads.
 For each claimed arrow connection, identify the
 source, destination, page, and visible arrow evidence.
 Do not invent connections that cannot be verified.
@@ -2951,6 +3035,19 @@ The requested PDF page could not be rendered.
 Do not claim to have visually verified the exercise.
 """
 
+
+    if problem_ref and section_ref:
+        prompt += f"""
+SECTION-SCOPED EXERCISE REQUEST:
+The student requested exercise/problem {problem_ref} from Section {section_ref}.
+Only use that section's pages to identify the exercise. A matching number in
+another section is NOT the requested exercise. If you cannot verify the
+exercise within Section {section_ref}, say the retrieval was insufficient.
+Do not say a student screenshot was attached unless STUDENT IMAGE is present.
+"""
+
+    if not uploaded_image:
+        prompt += "\nIMAGE PROVENANCE: The student did NOT upload an image with this request. Any supplied images are rendered textbook PDF pages. Never call them student screenshots or student attachments.\n"
 
     if should_render_exercises and not exercise_pages and page_filter is None:
         prompt += f"""
