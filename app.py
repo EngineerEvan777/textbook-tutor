@@ -2172,7 +2172,7 @@ async function exportChatPDF() {
   // All messages originate as textContent, and KaTeX markup is locally generated.
   const conversation = Array.from($('chat').children)
     .filter(el => el.classList.contains('msg') || el.classList.contains('meta'))
-    .map(el => el.outerHTML).join('\n');
+    .map(el => el.outerHTML).join('\\n');
   const printCSS = `
     @page { size: A4; margin: 16mm; }
     body { font: 11pt/1.55 Arial, sans-serif; color:#1b2430; margin:0; }
