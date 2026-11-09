@@ -1689,6 +1689,7 @@ def home():
       <div class="card">
         <div class="chatTitle">
           <h2>Chat</h2>
+          <button class="secondary" type="button" id="exportChatBtn" onclick="exportChatPDF()" title="Save this chat as a PDF using your browser's Print / Save as PDF dialog">Export PDF</button>
           <div class="pill" id="chatPill">
             <span class="dot ok" id="chatDot"></span>
             <span id="chatText">Idle</span>
@@ -2131,6 +2132,98 @@ function addMeta(text) {
   div.textContent = text;
   chat.appendChild(div);
   scrollChatToBottom();
+}
+
+// Export the currently displayed chat as a print-ready document. KaTeX output is
+// copied from the rendered DOM, preserving equations and inline page citations.
+// Browser print -> "Save as PDF" avoids server storage and extra dependencies.
+async function exportChatPDF() {
+  const messages = Array.from(document.querySelectorAll('#chat .msg'));
+  if (!messages.length) {
+    toast('bad', 'Nothing to export', 'Ask a question first.');
+    return;
+  }
+  // Open synchronously from the button click so popup blockers do not interfere.
+  const popup = window.open('', '_blank');
+  if (!popup) {
+    toast('bad', 'Pop-up blocked', 'Allow pop-ups to export your chat as a PDF.');
+    return;
+  }
+  popup.document.write('<!doctype html><html><head><title>Textbook Tutor - Chat Export</title></head><body><p>Preparing chat export...</p></body></html>');
+  popup.document.close();
+  const escapeHTML = (value) => String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const bookSelect = $('bookSelect');
+  const bookName = bookSelect?.selectedOptions?.[0]?.textContent || 'Selected textbook';
+  const sessionId = $('sessionId').value.trim();
+  let usage = $('usageLine')?.textContent || 'Session usage unavailable';
+  try {
+    const headers = await authHeaders();
+    const response = await fetch('/session/usage?session_id=' + encodeURIComponent(sessionId), {headers});
+    if (response.ok) {
+      const data = await response.json();
+      usage = `Session usage: ${(data.total_tokens || 0).toLocaleString()} tokens • ${(data.input_tokens || 0).toLocaleString()} in • ${(data.output_tokens || 0).toLocaleString()} out`;
+    }
+  } catch (error) {
+    console.warn('Export: latest token usage unavailable; using displayed total.', error);
+  }
+  // Copy only chat messages and citation/usage lines; do not export input controls.
+  // All messages originate as textContent, and KaTeX markup is locally generated.
+  const conversation = Array.from($('chat').children)
+    .filter(el => el.classList.contains('msg') || el.classList.contains('meta'))
+    .map(el => el.outerHTML).join('\n');
+  const printCSS = `
+    @page { size: A4; margin: 16mm; }
+    body { font: 11pt/1.55 Arial, sans-serif; color:#1b2430; margin:0; }
+    h1 { font-size:20pt; margin:0 0 4mm; }
+    .subtitle { color:#555; font-size:9pt; margin-bottom:8mm; overflow-wrap:anywhere; }
+    .msg { white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid #dce2ec;
+           border-radius:8px; padding:10px 12px; margin:10px 0 5px; }
+    .msg.user { background:#edf3ff; border-color:#c7d8fc; margin-left:12mm; }
+    .msg.assistant { background:white; }
+    .msg.user::before { content:'Student'; display:block; font-weight:bold; margin-bottom:5px; }
+    .msg.assistant::before { content:'Textbook Tutor'; display:block; font-weight:bold; margin-bottom:5px; }
+    .meta { color:#5a687e; font-size:9pt; margin:3px 0 8px 4px; overflow-wrap:anywhere; }
+    .katex-display { overflow:visible !important; max-width:100%; margin:10px 0 !important; }
+    .katex { font-size:1em !important; }
+    .katex-html { white-space:normal; }
+    .msg, .meta { break-inside:auto; }
+    .katex-display, .katex, .msg.user { break-inside:avoid; }
+    footer { border-top:1px solid #ccc; padding-top:7mm; margin-top:12mm; font-size:9pt; }
+    @media print { .msg.user { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+  `;
+  const doc = popup.document;
+  doc.open();
+  doc.write(`<!doctype html><html><head><meta charset="utf-8">
+    <title>Textbook Tutor - Chat Export</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.7/dist/katex.min.css">
+    <style>${printCSS}</style></head><body>
+    <h1>Textbook Tutor — Study Session</h1>
+    <div class="subtitle">Book: ${escapeHTML(bookName)}<br>
+    Date: ${escapeHTML(new Date().toLocaleString())}<br>
+    Session: ${escapeHTML(sessionId)}</div>
+    <main>${conversation}</main>
+    <footer>${escapeHTML(usage)}<br>Textbook page references are shown alongside the answers.</footer>
+    </body></html>`);
+  doc.close();
+  try {
+    // Wait for KaTeX CSS and webfonts to finish loading before printing.
+    await Promise.race([
+      Promise.all([
+        new Promise(resolve => {
+          const sheet = doc.querySelector('link[rel="stylesheet"]');
+          if (!sheet || sheet.sheet) return resolve();
+          sheet.addEventListener('load', resolve, {once:true});
+          sheet.addEventListener('error', resolve, {once:true});
+        }),
+        doc.fonts ? doc.fonts.ready : Promise.resolve()
+      ]),
+      new Promise(resolve => setTimeout(resolve, 4500))
+    ]);
+  } catch (_) { /* Print is still available if font loading fails. */ }
+  popup.focus();
+  popup.print();
 }
 
 function collapseSetupIfReady() {
