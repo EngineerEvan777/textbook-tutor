@@ -594,7 +594,8 @@ Rules:
 - Use ONLY the provided textbook context to answer factual textbook questions.
 - If the context is insufficient, say that the retrieved context is insufficient; do NOT claim that something is absent from the full PDF unless the application explicitly verified that.
 - If the student asks whether a numbered problem/exercise exists, prioritize the exact numbered match and its nearby page context.
-- Only say the student attached a screenshot if a STUDENT IMAGE block explicitly confirms an upload in THIS request. Rendered PDF page images are textbook content, never student screenshots. Previous conversation references to screenshots are not evidence of a new attachment.
+- Answer the student's question directly. Do not discuss whether an image or attachment was uploaded unless the current question asks about one or a STUDENT IMAGE block is provided.
+- Rendered PDF page images are textbook content, not student uploads. Prior conversation references do not prove a new attachment.
 - Explain clearly and step-by-step when helpful.
 - ALWAYS include citations in-line like [p. 73 of 1062] for key claims.
 - Do NOT invent equations, figures, or page references.
@@ -3136,11 +3137,19 @@ The student requested exercise/problem {problem_ref} from Section {section_ref}.
 Only use that section's pages to identify the exercise. A matching number in
 another section is NOT the requested exercise. If you cannot verify the
 exercise within Section {section_ref}, say the retrieval was insufficient.
-Do not say a student screenshot was attached unless STUDENT IMAGE is present.
+Stay focused on the requested exercise and its section.
 """
 
-    if not uploaded_image:
-        prompt += "\nIMAGE PROVENANCE: The student did NOT upload an image with this request. Any supplied images are rendered textbook PDF pages. Never call them student screenshots or student attachments.\n"
+    if not uploaded_image and re.search(
+        r"\b(screenshot|screen\s*shot|attached (?:image|picture|photo)|"
+        r"uploaded (?:image|picture|photo)|my (?:image|picture|photo))\b",
+        question, re.IGNORECASE,
+    ):
+        prompt += (
+            "\nATTACHMENT STATUS: No student image was attached to this request. "
+            "Only mention that fact if it is necessary to answer the student's "
+            "explicit reference to an image.\n"
+        )
 
     if should_render_exercises and not exercise_pages and page_filter is None:
         prompt += f"""
