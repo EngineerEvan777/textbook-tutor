@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Request
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
@@ -206,6 +206,25 @@ def get_current_user(authorization: Optional[str]) -> Dict[str, str]:
         raise HTTPException(status_code=401, detail="Could not determine authenticated user.")
 
     return {"id": user_id, "email": email}
+
+# ----------------------------
+# FLOW webhook
+# ----------------------------
+@app.post("/webhooks/flow")
+async def flow_webhook(request: Request):
+    payload = await request.json()
+
+    logger.info(
+        "FLOW webhook received: event_type=%s email=%s contact_id=%s",
+        payload.get("event_type"),
+        payload.get("email"),
+        payload.get("contact_id"),
+    )
+
+    return {
+        "ok": True,
+        "message": "FLOW webhook received."
+    }
 
 
 def get_session_cache_key(user_id: str, session_id: str) -> str:
