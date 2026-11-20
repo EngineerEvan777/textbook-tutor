@@ -2774,12 +2774,29 @@ async def flow_order_paid(
             async with request.form(max_files=0) as form:
                 payload = {field: form[field] for field in FlowOrder.model_fields if field in form}
         else:
+            logger.warning("FLOW order rejected: missing or unsupported Content-Type.")
             raise HTTPException(
                 status_code=400,
                 detail="Expected JSON or form data for the FLOW order. Check the Content-Type header.",
             )
-        order = FlowOrder.model_validate(payload)
+
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a FLOW order object.")
+
+        # The standard webhook puts configured Custom Data under customData.
+        custom_data = payload.get("customData")
+        custom_fields = {}
+        if isinstance(custom_data, dict):
+            custom_fields = {field: custom_data[field] for field in FlowOrder.model_fields if field in custom_data}
+        logger.info(
+            "FLOW order parsed: content_type=%s top_level_fields=%s customData_fields=%s",
+            content_type,
+            sorted(payload.keys() & FlowOrder.model_fields.keys()),
+            sorted(custom_fields),
+        )
+        order = FlowOrder.model_validate({**payload, **custom_fields})
     except ValueError:
+        logger.warning("FLOW order rejected: invalid payload (content_type=%s).", content_type)
         raise HTTPException(status_code=400, detail="Expected a valid FLOW order in JSON or form data.") from None
 
     if order.event_type != "order_submitted":
@@ -2789,7 +2806,7 @@ async def flow_order_paid(
     if len(email) > 254 or len(email.partition("@")[0]) > 64 or not FLOW_EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=400, detail="A valid email is required.")
 
-    await run_in_threadpool(
+    response = await run_in_threadpool(
         supabase_authorized_users_request,
         "POST",
         params={"on_conflict": "email"},
@@ -2801,6 +2818,7 @@ async def flow_order_paid(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         },
     )
+    logger.info("FLOW order upsert completed: supabase_status=%s", response.status_code)
     return {"ok": True, "email": email, "authorized": True}
 
 
