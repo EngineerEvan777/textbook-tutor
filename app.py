@@ -2766,10 +2766,21 @@ async def flow_order_paid(
     ):
         raise HTTPException(status_code=401, detail="Invalid webhook secret.")
 
+    content_type = request.headers.get("Content-Type", "").partition(";")[0].strip().lower()
     try:
-        order = FlowOrder.model_validate(await request.json())
+        if content_type == "application/json":
+            payload = await request.json()
+        elif content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+            async with request.form(max_files=0) as form:
+                payload = {field: form[field] for field in FlowOrder.model_fields if field in form}
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Expected JSON or form data for the FLOW order. Check the Content-Type header.",
+            )
+        order = FlowOrder.model_validate(payload)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Expected a valid FLOW order JSON object.") from None
+        raise HTTPException(status_code=400, detail="Expected a valid FLOW order in JSON or form data.") from None
 
     if order.event_type != "order_submitted":
         raise HTTPException(status_code=400, detail="Unsupported FLOW event type.")
