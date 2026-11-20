@@ -18,6 +18,8 @@ import re
 import sqlite3
 import uuid
 import time
+from datetime import datetime, timezone
+from hmac import compare_digest
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -30,6 +32,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Requ
 from fastapi.responses import HTMLResponse, Response
 from pypdf import PdfReader
 from openai import OpenAI
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 import requests
 
 # ----------------------------
@@ -172,6 +176,14 @@ def get_supabase_publishable_key() -> str:
     return key
 
 
+def get_supabase_service_role_key() -> str:
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not key:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY is not set.")
+        raise HTTPException(status_code=503, detail="Textbook Tutor authorization is unavailable.")
+    return key
+
+
 def parse_bearer_token(authorization: Optional[str]) -> str:
     auth = (authorization or "").strip()
     if not auth or not auth.lower().startswith("bearer "):
@@ -206,6 +218,81 @@ def get_current_user(authorization: Optional[str]) -> Dict[str, str]:
         raise HTTPException(status_code=401, detail="Could not determine authenticated user.")
 
     return {"id": user_id, "email": email}
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def supabase_authorized_users_request(
+    method: str,
+    *,
+    params: Dict[str, str],
+    payload: Optional[Dict] = None,
+) -> requests.Response:
+    key = get_supabase_service_role_key()
+    url = f"{get_supabase_url()}/rest/v1/authorized_users"
+    headers = {"apikey": key}
+    if method == "POST":
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+
+    try:
+        response = requests.request(
+            method, url, headers=headers, params=params, json=payload,
+            timeout=10, allow_redirects=False,
+        )
+    except (requests.RequestException, UnicodeError):
+        logger.warning("Supabase authorization %s request failed.", method)
+        raise HTTPException(status_code=503, detail="Textbook Tutor authorization is unavailable.") from None
+
+    expected_statuses = (200,) if method == "GET" else (200, 201)
+    if response.status_code not in expected_statuses:
+        logger.warning("Supabase authorization %s returned status %s.", method, response.status_code)
+        raise HTTPException(status_code=503, detail="Textbook Tutor authorization is unavailable.")
+    return response
+
+
+def is_user_authorized(email: str) -> bool:
+    email = normalize_email(email)
+    if not email:
+        return False
+
+    # Prefer the normalized primary key. Also support older manual rows with case or whitespace differences.
+    filters = (f"eq.{email}", f"imatch.^[[:space:]]*{re.escape(email)}[[:space:]]*$")
+    for email_filter in filters:
+        try:
+            response = supabase_authorized_users_request(
+                "GET", params={"email": email_filter, "select": "email,authorized", "limit": "2"},
+            )
+            rows = response.json()
+        except HTTPException:
+            return False
+        except ValueError:
+            logger.warning("Supabase authorization returned invalid JSON.")
+            return False
+
+        if rows == []:
+            continue
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            return False
+        row = rows[0]
+        stored_email = row.get("email")
+        return (
+            isinstance(stored_email, str)
+            and normalize_email(stored_email) == email
+            and row.get("authorized") is True
+        )
+    return False
+
+
+def get_authorized_user(authorization: Optional[str]) -> Dict[str, str]:
+    user = get_current_user(authorization)
+    if not is_user_authorized(user["email"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is not currently authorized to use Textbook Tutor.",
+        )
+    return user
 
 
 def get_session_cache_key(user_id: str, session_id: str) -> str:
@@ -1732,16 +1819,13 @@ const SUPABASE_URL = __SUPABASE_URL__;
 const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_KEY__;
 
 let sb = null;
+let accessCheck = 0;
 
 try {
   console.log("SUPABASE_URL:", SUPABASE_URL);
   console.log("SUPABASE_PUBLISHABLE_KEY exists:", !!SUPABASE_PUBLISHABLE_KEY);
 
   sb = supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
-
-  sb.auth.onAuthStateChange(() => {
-    showUser();
-  });
 } catch (err) {
   console.error("Supabase client init failed:", err);
   document.getElementById("loginStatus").textContent =
@@ -1819,35 +1903,15 @@ function setAuthUI(isLoggedIn) {
   }
 }
 
-async function showUser() {
-  if (!sb) {
-    document.getElementById("loginStatus").textContent =
-      "Login is not initialized. Check Supabase settings.";
-    document.getElementById("appContent").style.display = "none";
-    setAuthUI(false);
-    return;
-  }
+async function showUser(session) {
+  const check = ++accessCheck;
+  const status = document.getElementById("loginStatus");
+  const appContent = document.getElementById("appContent");
+  appContent.style.display = "none";
+  setAuthUI(Boolean(session));
 
-  const { data } = await sb.auth.getSession();
-
-  if (data.session) {
-    const email = data.session.user.email;
-
-    document.getElementById("loginStatus").textContent =
-      "Logged in as: " + email;
-
-    document.getElementById("loginEmail").value = email || "";
-    document.getElementById("appContent").style.display = "block";
-    setAuthUI(true);
-    refreshBooks();
-    refreshUsage();
-  } else {
-    document.getElementById("loginStatus").textContent =
-      "Please login to use Textbook Tutor.";
-
-    document.getElementById("appContent").style.display = "none";
-    setAuthUI(false);
-
+  if (!session) {
+    status.textContent = "Please login to use Textbook Tutor.";
     const sel = document.getElementById("bookSelect");
     if (sel) {
       sel.innerHTML = '';
@@ -1856,6 +1920,31 @@ async function showUser() {
       opt.textContent = "Login to view your books";
       sel.appendChild(opt);
       sel.disabled = true;
+    }
+    return;
+  }
+
+  document.getElementById("loginEmail").value = session.user.email || "";
+  status.textContent = "Checking your Textbook Tutor access…";
+  try {
+    const response = await fetch("/access/me", {
+      headers: { Authorization: "Bearer " + session.access_token },
+    });
+    if (!response.ok) throw new Error("Access check failed");
+    const access = await response.json();
+    if (check !== accessCheck) return;
+    if (access.authenticated !== true || access.authorized !== true) {
+      status.textContent = "Your account is signed in, but it is not currently authorized to use Textbook Tutor. If you purchased access, please make sure you are using the same email address used during checkout.";
+      return;
+    }
+
+    status.textContent = "Logged in as: " + access.email;
+    appContent.style.display = "block";
+    refreshBooks();
+    refreshUsage();
+  } catch {
+    if (check === accessCheck) {
+      status.textContent = "Could not verify your Textbook Tutor access. Reload the page to try again.";
     }
   }
 }
@@ -1932,9 +2021,7 @@ async function loginWithPassword() {
         status.textContent = "Error: " + error.message;
       }
     } else {
-      status.textContent = "Logged in successfully.";
       document.getElementById("loginPassword").value = "";
-      await showUser();
     }
   } catch (err) {
     console.error("loginWithPassword failed:", err);
@@ -1981,19 +2068,10 @@ async function signUpWithPassword() {
       return;
     }
 
-    const { error: loginError } = await sb.auth.signInWithPassword({
-      email,
-      password
-    });
-
-    if (loginError) {
-      status.textContent = "Account created. Now log in with your email and password.";
-      return;
-    }
-
     document.getElementById("loginPassword").value = "";
-    status.textContent = "Account created and logged in successfully.";
-    await showUser();
+    if (!data.session) {
+      status.textContent = "Check your email to confirm your account, then log in.";
+    }
   } catch (err) {
     console.error("signUpWithPassword failed:", err);
     status.textContent = "Error: " + (err.message || String(err));
@@ -2007,12 +2085,13 @@ async function logout() {
     return;
   }
 
-  await sb.auth.signOut();
-  document.getElementById("loginStatus").textContent = "Logged out";
-  document.getElementById("appContent").style.display = "none";
+  const { error } = await sb.auth.signOut();
+  if (error) {
+    document.getElementById("loginStatus").textContent = "Error: " + error.message;
+    return;
+  }
   document.getElementById("loginPassword").value = "";
   document.getElementById("loginEmail").value = "";
-  setAuthUI(false);
 }
 
 async function requireLogin() {
@@ -2631,7 +2710,12 @@ restore();
 if (!$("sessionId").value.trim()) $("sessionId").value = uuidv4();
 setServiceState("ok","Ready");
 setChatState("ok","Idle");
-showUser();
+setAuthUI(false);
+if (sb) {
+  sb.auth.onAuthStateChange((_event, session) => {
+    void showUser(session);
+  });
+}
 </script>
 </body>
 </html>
@@ -2642,9 +2726,76 @@ showUser();
     return html
 
 
+@app.get("/access/me")
+def access_me(response: Response, authorization: Optional[str] = Header(default=None)):
+    user = get_current_user(authorization)
+    email = normalize_email(user["email"])
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "authenticated": True,
+        "authorized": is_user_authorized(email),
+        "email": email,
+    }
+
+
+class FlowOrder(BaseModel):
+    email: str
+    event_type: str
+    contact_id: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+FLOW_EMAIL_PATTERN = re.compile(
+    r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+)
+
+
+# Before publishing to production, verify that FLOW's Order Submitted trigger
+# fires only after successful Stripe payment for each configured order.
+@app.post("/flow/order-paid")
+async def flow_order_paid(
+    request: Request,
+    webhook_secret: Optional[str] = Header(default=None, alias="X-Textbook-Tutor-Secret"),
+):
+    expected_secret = os.getenv("FLOW_WEBHOOK_SECRET", "")
+    if not expected_secret.strip() or not compare_digest(
+        (webhook_secret or "").encode("utf-8"), expected_secret.encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret.")
+
+    try:
+        order = FlowOrder.model_validate(await request.json())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Expected a valid FLOW order JSON object.") from None
+
+    if order.event_type != "order_submitted":
+        raise HTTPException(status_code=400, detail="Unsupported FLOW event type.")
+
+    email = normalize_email(order.email)
+    if len(email) > 254 or len(email.partition("@")[0]) > 64 or not FLOW_EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+
+    await run_in_threadpool(
+        supabase_authorized_users_request,
+        "POST",
+        params={"on_conflict": "email"},
+        payload={
+            "email": email,
+            "authorized": True,
+            "source": "stripe",
+            "flow_contact_id": order.contact_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return {"ok": True, "email": email, "authorized": True}
+
+
 @app.get("/books")
 def list_books(authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
+    user = get_authorized_user(authorization)
     out = []
     for b in BOOKS.values():
         if b.owner_user_id != user["id"]:
@@ -2661,7 +2812,7 @@ def list_books(authorization: Optional[str] = Header(default=None)):
 
 @app.post("/books/delete")
 def delete_book(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
+    user = get_authorized_user(authorization)
     book_id = (payload.get("book_id") or "").strip()
 
     if not book_id:
@@ -2698,7 +2849,7 @@ async def upload(
     title: Optional[str] = Form(None),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = get_current_user(authorization)
+    user = await run_in_threadpool(get_authorized_user, authorization)
     logger.info("Upload started for user_id=%s", user["id"])
 
     user_book_count = sum(
@@ -2815,7 +2966,7 @@ async def upload(
 
 @app.post("/session/reset")
 def reset_session(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
+    user = get_authorized_user(authorization)
     sid = (payload.get("session_id") or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="Missing session_id.")
@@ -2836,7 +2987,7 @@ def reset_session(payload: Dict[str, str], authorization: Optional[str] = Header
 
 @app.get("/session/usage")
 def get_session_usage(session_id: str, authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
+    user = get_authorized_user(authorization)
     sid = (session_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="Missing session_id.")
@@ -3199,7 +3350,7 @@ Ask for an exact PDF page or a screenshot if the student has one.
 
 @app.post("/chat")
 def chat(payload: Dict[str, str], authorization: Optional[str] = Header(default=None)):
-    user = get_current_user(authorization)
+    user = get_authorized_user(authorization)
     return process_chat_request(
         user=user,
         book_id=(payload.get("book_id") or "").strip(),
@@ -3217,7 +3368,7 @@ async def chat_with_image(
     image: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    user = get_current_user(authorization)
+    user = await run_in_threadpool(get_authorized_user, authorization)
 
     content_type = (image.content_type or "").lower()
     allowed = {"image/png", "image/jpeg", "image/webp"}
