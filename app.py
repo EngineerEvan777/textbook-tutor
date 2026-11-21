@@ -19,10 +19,11 @@ import sqlite3
 import uuid
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from hmac import compare_digest
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NoReturn, Optional, Tuple
 
 
 
@@ -2741,6 +2742,7 @@ def access_me(response: Response, authorization: Optional[str] = Header(default=
 class FlowOrder(BaseModel):
     email: str
     event_type: str
+    payment_transaction_id: str
     contact_id: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -2751,10 +2753,113 @@ FLOW_EMAIL_PATTERN = re.compile(
     r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 )
+FLOW_PAYMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+FLOW_TUTOR_PRODUCTS = frozenset({"Textbook Tutor: Basic", "Textbook Tutor: Pro", "Textbook Tutor: Nerd"})
 
 
-# Before publishing to production, verify that FLOW's Order Submitted trigger
-# fires only after successful Stripe payment for each configured order.
+def reject_flow_payment(reason: str, status_code: int = 403) -> NoReturn:
+    logger.warning("FLOW payment verification failed: %s", reason)
+    raise HTTPException(status_code=status_code, detail="FLOW payment could not be verified.") from None
+
+
+def get_flow_payment_record(resource: str, record_id: str, token: str, location_id: str) -> Dict:
+    params = {"altId": location_id}
+    if resource == "transactions":
+        params["altType"] = "location"
+
+    logger.info("FLOW %s lookup attempted.", resource)
+    try:
+        response = requests.get(
+            f"https://services.leadconnectorhq.com/payments/{resource}/{record_id}",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "Version": "v3"},
+            params=params, timeout=10, allow_redirects=False,
+        )
+    except (requests.RequestException, UnicodeError):
+        reject_flow_payment(f"{resource}_request_failed", 503)
+
+    logger.info("FLOW %s lookup returned status %s.", resource, response.status_code)
+    if response.status_code == 404:
+        reject_flow_payment(f"{resource}_not_found", 404)
+    if response.status_code != 200:
+        reject_flow_payment(f"{resource}_api_error", 503)
+
+    try:
+        record = response.json()
+    except ValueError:
+        reject_flow_payment(f"{resource}_invalid_json", 502)
+    if (
+        not isinstance(record, dict)
+        or record.get("_id") != record_id
+        or record.get("altId") != location_id
+        or record.get("altType") != "location"
+    ):
+        reject_flow_payment(f"{resource}_record_mismatch", 502)
+    return record
+
+
+def verify_flow_payment(order: FlowOrder, email: str) -> None:
+    transaction_id = order.payment_transaction_id.strip()
+    if not FLOW_PAYMENT_ID_PATTERN.fullmatch(transaction_id):
+        reject_flow_payment("invalid_transaction_id", 400)
+
+    token = os.getenv("FLOW_API_TOKEN", "").strip()
+    location_id = os.getenv("FLOW_LOCATION_ID", "").strip()
+    if not token or not FLOW_PAYMENT_ID_PATTERN.fullmatch(location_id):
+        reject_flow_payment("missing_or_invalid_api_configuration", 503)
+
+    transaction = get_flow_payment_record("transactions", transaction_id, token, location_id)
+    if transaction.get("status") != "succeeded":
+        reject_flow_payment("transaction_not_succeeded")
+    if transaction.get("liveMode") is not True or transaction.get("markAsTest", False) is not False:
+        reject_flow_payment("transaction_not_live")
+
+    provider = transaction.get("paymentProvider")
+    if not isinstance(provider, dict) or provider.get("type") != "stripe":
+        reject_flow_payment("transaction_not_stripe")
+    entity_source = transaction.get("entitySource")
+    charge = transaction.get("chargeSnapshot")
+    if (isinstance(entity_source, dict) and entity_source.get("type") == "manual") or (
+        isinstance(charge, dict) and charge.get("paid_out_of_band") is True
+    ):
+        reject_flow_payment("transaction_paid_outside_stripe")
+
+    refunded_amount = transaction.get("amountRefunded")
+    try:
+        amount = Decimal(str(transaction.get("amount")))
+        refunded = Decimal(str(refunded_amount)) if refunded_amount is not None else Decimal(0)
+    except InvalidOperation:
+        reject_flow_payment("invalid_transaction_amount")
+    if not amount.is_finite() or not refunded.is_finite() or refunded < 0 or amount <= refunded:
+        reject_flow_payment("no_positive_paid_balance")
+
+    buyer = transaction.get("contactSnapshot")
+    buyer_email = buyer.get("email") if isinstance(buyer, dict) else None
+    if not isinstance(buyer_email, str) or normalize_email(buyer_email) != email:
+        reject_flow_payment("buyer_email_mismatch_or_missing")
+    if order.contact_id and transaction.get("contactId") != order.contact_id:
+        reject_flow_payment("buyer_contact_mismatch")
+
+    order_id = transaction.get("entityId")
+    if (
+        transaction.get("entityType") != "order"
+        or not isinstance(order_id, str)
+        or not FLOW_PAYMENT_ID_PATTERN.fullmatch(order_id)
+    ):
+        reject_flow_payment("missing_linked_order")
+    paid_order = get_flow_payment_record("orders", order_id, token, location_id)
+    if paid_order.get("liveMode", True) is not True or paid_order.get("markAsTest", False) is not False:
+        reject_flow_payment("linked_order_not_live")
+    items = paid_order.get("items")
+    if not isinstance(items, list) or not items:
+        reject_flow_payment("missing_order_items")
+    for item in items:
+        product = item.get("product") if isinstance(item, dict) else None
+        name = product.get("name") if isinstance(product, dict) else None
+        if not isinstance(name, str) or name.strip() not in FLOW_TUTOR_PRODUCTS:
+            reject_flow_payment("order_product_not_allowed")
+    logger.info("FLOW payment verification passed.")
+
+
 @app.post("/flow/order-paid")
 async def flow_order_paid(
     request: Request,
@@ -2805,6 +2910,8 @@ async def flow_order_paid(
     email = normalize_email(order.email)
     if len(email) > 254 or len(email.partition("@")[0]) > 64 or not FLOW_EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=400, detail="A valid email is required.")
+
+    await run_in_threadpool(verify_flow_payment, order, email)
 
     response = await run_in_threadpool(
         supabase_authorized_users_request,
