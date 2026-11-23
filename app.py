@@ -2763,9 +2763,7 @@ def reject_flow_payment(reason: str, status_code: int = 403) -> NoReturn:
 
 
 def get_flow_payment_record(resource: str, record_id: str, token: str, location_id: str) -> Dict:
-    params = {"altId": location_id}
-    if resource == "transactions":
-        params["altType"] = "location"
+    params = {"altId": location_id, "altType": "location"}
 
     logger.info("FLOW %s lookup attempted.", resource)
     try:
@@ -2787,6 +2785,8 @@ def get_flow_payment_record(resource: str, record_id: str, token: str, location_
         record = response.json()
     except ValueError:
         reject_flow_payment(f"{resource}_invalid_json", 502)
+    if resource == "transactions" and isinstance(record, list) and len(record) == 1:
+        record = record[0]
     if (
         not isinstance(record, dict)
         or record.get("_id") != record_id
