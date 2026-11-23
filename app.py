@@ -2929,6 +2929,132 @@ async def flow_order_paid(
     return {"ok": True, "email": email, "authorized": True}
 
 
+class FlowPromoOrder(BaseModel):
+    email: str
+    event_type: str
+    order_id: str
+    contact_id: Optional[str] = None
+
+
+def reject_flow_promo(reason: str, status_code: int = 403) -> NoReturn:
+    logger.warning("FLOW promo verification failed: %s", reason)
+    raise HTTPException(status_code=status_code, detail="FLOW promo order could not be verified.") from None
+
+
+def verify_flow_promo(order: FlowPromoOrder, email: str) -> Optional[str]:
+    order_id = order.order_id.strip()
+    if not FLOW_PAYMENT_ID_PATTERN.fullmatch(order_id):
+        reject_flow_promo("invalid_order_id", 400)
+
+    token = os.getenv("FLOW_API_TOKEN", "").strip()
+    location_id = os.getenv("FLOW_LOCATION_ID", "").strip()
+    allowed_coupon_ids = {part.strip() for part in os.getenv("FLOW_ALLOWED_PROMO_IDS", "").split(",")} - {""}
+    if (
+        not token or not FLOW_PAYMENT_ID_PATTERN.fullmatch(location_id)
+        or not allowed_coupon_ids or any(not FLOW_PAYMENT_ID_PATTERN.fullmatch(value) for value in allowed_coupon_ids)
+    ):
+        reject_flow_promo("missing_or_invalid_api_or_promo_configuration", 503)
+
+    record = get_flow_payment_record("orders", order_id, token, location_id)
+    if record.get("status") != "completed":
+        reject_flow_promo("order_not_completed")
+    if record.get("liveMode") is not True or record.get("markAsTest") is not False:
+        reject_flow_promo("order_not_live")
+    source = record.get("source")
+    if not isinstance(source, dict) or source.get("type") != "funnel":
+        reject_flow_promo("order_not_from_funnel")
+
+    buyer = record.get("contactSnapshot")
+    buyer_email = buyer.get("email") if isinstance(buyer, dict) else None
+    if not isinstance(buyer_email, str) or normalize_email(buyer_email) != email:
+        reject_flow_promo("buyer_email_mismatch_or_missing")
+    contact_id = record.get("contactId")
+    if order.contact_id and contact_id != order.contact_id:
+        reject_flow_promo("buyer_contact_mismatch")
+
+    coupon = record.get("coupon")
+    coupon_id = coupon.get("_id") if isinstance(coupon, dict) else None
+    if not isinstance(coupon_id, str) or coupon_id not in allowed_coupon_ids:
+        reject_flow_promo("coupon_not_allowed")
+    summary = record.get("amountSummary")
+    if not isinstance(summary, dict):
+        reject_flow_promo("missing_amount_summary")
+    try:
+        total = Decimal(str(record.get("amount")))
+        subtotal = Decimal(str(summary.get("subtotal")))
+        discount = Decimal(str(summary.get("discount")))
+    except InvalidOperation:
+        reject_flow_promo("invalid_order_amount")
+    if not all(value.is_finite() for value in (total, subtotal, discount)) or (
+        total != 0 or subtotal <= 0 or discount != subtotal
+    ):
+        reject_flow_promo("order_not_fully_discounted")
+
+    items = record.get("items")
+    if not isinstance(items, list) or not items:
+        reject_flow_promo("missing_order_items")
+    for item in items:
+        product = item.get("product") if isinstance(item, dict) else None
+        name = product.get("name") if isinstance(product, dict) else None
+        if not isinstance(name, str) or name.strip() not in FLOW_TUTOR_PRODUCTS:
+            reject_flow_promo("order_product_not_allowed")
+
+    logger.info("FLOW promo verification passed.")
+    return contact_id if isinstance(contact_id, str) and contact_id else None
+
+
+@app.post("/flow/order-promo")
+async def flow_order_promo(
+    request: Request,
+    webhook_secret: Optional[str] = Header(default=None, alias="X-Textbook-Tutor-Secret"),
+):
+    expected_secret = os.getenv("FLOW_WEBHOOK_SECRET", "")
+    if not expected_secret.strip() or not compare_digest(
+        (webhook_secret or "").encode("utf-8"), expected_secret.encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret.")
+
+    content_type = request.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+    try:
+        if content_type == "application/json":
+            payload = await request.json()
+        elif content_type in {"application/x-www-form-urlencoded", "multipart/form-data"}:
+            async with request.form(max_files=0) as form:
+                payload = {field: form[field] for field in FlowPromoOrder.model_fields if field in form}
+        else:
+            raise ValueError("Unsupported content type.")
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a FLOW promo order object.")
+        custom_data = payload.get("customData")
+        if isinstance(custom_data, dict):
+            payload = {**payload, **custom_data}
+        order = FlowPromoOrder.model_validate(payload)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Expected a valid FLOW promo order in JSON or form data.") from None
+
+    if order.event_type != "promo_redeemed":
+        raise HTTPException(status_code=400, detail="Unsupported FLOW event type.")
+    email = normalize_email(order.email)
+    if len(email) > 254 or len(email.partition("@")[0]) > 64 or not FLOW_EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+
+    contact_id = await run_in_threadpool(verify_flow_promo, order, email)
+    response = await run_in_threadpool(
+        supabase_authorized_users_request,
+        "POST",
+        params={"on_conflict": "email"},
+        payload={
+            "email": email,
+            "authorized": True,
+            "source": "promo",
+            "flow_contact_id": contact_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info("FLOW promo upsert completed: supabase_status=%s", response.status_code)
+    return {"ok": True, "email": email, "authorized": True}
+
+
 @app.get("/books")
 def list_books(authorization: Optional[str] = Header(default=None)):
     user = get_authorized_user(authorization)
