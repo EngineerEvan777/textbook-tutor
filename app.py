@@ -20,7 +20,7 @@ import uuid
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from hmac import compare_digest
+from hmac import compare_digest, digest
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, NoReturn, Optional, Tuple
@@ -2755,6 +2755,7 @@ FLOW_EMAIL_PATTERN = re.compile(
 )
 FLOW_PAYMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 FLOW_TUTOR_PRODUCTS = frozenset({"Textbook Tutor: Basic", "Textbook Tutor: Pro", "Textbook Tutor: Nerd"})
+STRIPE_SUBSCRIPTION_ID_PATTERN = re.compile(r"sub_[A-Za-z0-9]{1,124}")
 
 
 def reject_flow_payment(reason: str, status_code: int = 403) -> NoReturn:
@@ -2797,7 +2798,7 @@ def get_flow_payment_record(resource: str, record_id: str, token: str, location_
     return record
 
 
-def verify_flow_payment(order: FlowOrder, email: str) -> None:
+def verify_flow_payment(order: FlowOrder, email: str) -> Dict:
     transaction_id = order.payment_transaction_id.strip()
     if not FLOW_PAYMENT_ID_PATTERN.fullmatch(transaction_id):
         reject_flow_payment("invalid_transaction_id", 400)
@@ -2858,6 +2859,78 @@ def verify_flow_payment(order: FlowOrder, email: str) -> None:
         if not isinstance(name, str) or name.strip() not in FLOW_TUTOR_PRODUCTS:
             reject_flow_payment("order_product_not_allowed")
     logger.info("FLOW payment verification passed.")
+    return transaction
+
+
+def record_stripe_subscription_access(subscription_id: str, **changes) -> bool:
+    try:
+        response = requests.post(
+            f"{get_supabase_url()}/rest/v1/rpc/record_tutor_subscription_access",
+            headers={"apikey": get_supabase_service_role_key()},
+            json={"p_subscription_id": subscription_id, **changes},
+            timeout=10, allow_redirects=False,
+        )
+        if response.status_code == 200:
+            accepted = response.json()
+            if isinstance(accepted, bool):
+                return accepted
+        logger.warning("Supabase subscription access returned status %s.", response.status_code)
+    except (requests.RequestException, UnicodeError, ValueError):
+        logger.warning("Supabase subscription access request failed.")
+    raise HTTPException(status_code=503, detail="Textbook Tutor authorization is unavailable.") from None
+
+
+def grant_stripe_subscription_access(subscription_id: str, email: str, source: str, contact_id: str) -> None:
+    if not record_stripe_subscription_access(
+        subscription_id, p_email=email, p_source=source, p_contact_id=contact_id,
+    ):
+        reject_flow_payment("subscription_already_ended_or_bound")
+
+
+def get_flow_promo_subscription_id(order_id: str, contact_id: Optional[str]) -> str:
+    token = os.getenv("FLOW_SUBSCRIPTIONS_API_TOKEN", "").strip()
+    location_id = os.getenv("FLOW_LOCATION_ID", "").strip()
+    if not token or not isinstance(contact_id, str) or not FLOW_PAYMENT_ID_PATTERN.fullmatch(contact_id):
+        reject_flow_payment("missing_subscription_lookup_context", 503)
+
+    # The order workflow can arrive just before HighLevel makes its subscription readable.
+    for delay in (0, 0.5, 1.0):
+        if delay:
+            time.sleep(delay)
+        try:
+            response = requests.get(
+                "https://services.leadconnectorhq.com/payments/subscriptions",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "Version": "v3"},
+                params={"altId": location_id, "altType": "location", "entityId": order_id,
+                        "contactId": contact_id, "paymentMode": "live", "limit": 2},
+                timeout=5, allow_redirects=False,
+            )
+            if response.status_code != 200:
+                logger.warning("FLOW subscription lookup returned status %s.", response.status_code)
+                reject_flow_payment("subscription_lookup_api_error", 503)
+            page = response.json()
+        except (requests.RequestException, UnicodeError, ValueError):
+            reject_flow_payment("subscription_lookup_failed", 503)
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            reject_flow_payment("invalid_subscription_response", 502)
+        rows = page["data"]
+        if not rows and page.get("totalCount") == 0:
+            continue
+        if len(rows) != 1 or page.get("totalCount") != 1 or not isinstance(rows[0], dict):
+            reject_flow_payment("ambiguous_order_subscription", 502)
+        subscription = rows[0]
+        subscription_id = subscription.get("subscriptionId")
+        if (
+            subscription.get("altId") != location_id or subscription.get("altType") != "location"
+            or subscription.get("entityType") != "order" or subscription.get("entityId") != order_id
+            or subscription.get("contactId") != contact_id or subscription.get("liveMode") is not True
+            or subscription.get("paymentProviderType") != "stripe"
+            or subscription.get("status") not in ("active", "trialing")
+            or not isinstance(subscription_id, str) or not STRIPE_SUBSCRIPTION_ID_PATTERN.fullmatch(subscription_id)
+        ):
+            reject_flow_payment("promo_subscription_mismatch_or_inactive")
+        return subscription_id
+    reject_flow_payment("order_subscription_not_yet_available", 503)
 
 
 @app.post("/flow/order-paid")
@@ -2911,7 +2984,15 @@ async def flow_order_paid(
     if len(email) > 254 or len(email.partition("@")[0]) > 64 or not FLOW_EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(status_code=400, detail="A valid email is required.")
 
-    await run_in_threadpool(verify_flow_payment, order, email)
+    transaction = await run_in_threadpool(verify_flow_payment, order, email)
+    if os.getenv("STRIPE_SUBSCRIPTION_WEBHOOK_SECRET"):
+        subscription_id = transaction.get("subscriptionId")
+        if not isinstance(subscription_id, str) or not STRIPE_SUBSCRIPTION_ID_PATTERN.fullmatch(subscription_id):
+            reject_flow_payment("missing_transaction_subscription")
+        await run_in_threadpool(
+            grant_stripe_subscription_access, subscription_id, email, "stripe", transaction.get("contactId"),
+        )
+        return {"ok": True, "email": email, "authorized": True}
 
     response = await run_in_threadpool(
         supabase_authorized_users_request,
@@ -3039,6 +3120,10 @@ async def flow_order_promo(
         raise HTTPException(status_code=400, detail="A valid email is required.")
 
     contact_id = await run_in_threadpool(verify_flow_promo, order, email)
+    if os.getenv("STRIPE_SUBSCRIPTION_WEBHOOK_SECRET"):
+        subscription_id = await run_in_threadpool(get_flow_promo_subscription_id, order.order_id.strip(), contact_id)
+        await run_in_threadpool(grant_stripe_subscription_access, subscription_id, email, "promo", contact_id)
+        return {"ok": True, "email": email, "authorized": True}
     response = await run_in_threadpool(
         supabase_authorized_users_request,
         "POST",
@@ -3053,6 +3138,63 @@ async def flow_order_promo(
     )
     logger.info("FLOW promo upsert completed: supabase_status=%s", response.status_code)
     return {"ok": True, "email": email, "authorized": True}
+
+
+@app.post("/stripe/subscription-ended")
+async def stripe_subscription_ended(
+    request: Request,
+    signature: str = Header(default="", alias="Stripe-Signature"),
+):
+    secret = os.getenv("STRIPE_SUBSCRIPTION_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Stripe cancellation webhook is unavailable.")
+
+    timestamp = ""
+    signatures = []
+    for part in signature.split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "t":
+            timestamp = value
+        elif key == "v1" and re.fullmatch(r"[0-9a-f]{64}", value):
+            signatures.append(bytes.fromhex(value))
+    if not re.fullmatch(r"[0-9]{1,12}", timestamp) or abs(time.time() - int(timestamp)) > 300:
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature.")
+
+    body = await request.body()
+    expected = digest(secret.encode(), timestamp.encode("ascii") + b"." + body, "sha256")
+    if not any(compare_digest(expected, value) for value in signatures):
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature.")
+
+    try:
+        event = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=400, detail="Invalid Stripe event.") from None
+    if not isinstance(event, dict) or event.get("object") != "event":
+        raise HTTPException(status_code=400, detail="Invalid Stripe event.")
+    if event.get("type") != "customer.subscription.deleted" or event.get("livemode") is not True:
+        return {"ok": True, "ignored": True}
+
+    data = event.get("data")
+    subscription = data.get("object") if isinstance(data, dict) else None
+    if not isinstance(subscription, dict):
+        raise HTTPException(status_code=400, detail="Invalid Stripe subscription.")
+    subscription_id = subscription.get("id")
+    ended_at = subscription.get("ended_at")
+    if (
+        subscription.get("object") != "subscription" or subscription.get("status") != "canceled"
+        or subscription.get("livemode") is not True
+        or not isinstance(subscription_id, str) or not STRIPE_SUBSCRIPTION_ID_PATTERN.fullmatch(subscription_id)
+        or type(ended_at) is not int or not 0 < ended_at <= time.time()
+    ):
+        raise HTTPException(status_code=400, detail="Stripe subscription end could not be verified.")
+
+    matched = await run_in_threadpool(
+        record_stripe_subscription_access,
+        subscription_id,
+        p_ended_at=datetime.fromtimestamp(ended_at, timezone.utc).isoformat(),
+    )
+    logger.info("Stripe subscription end recorded: matched_entitlement=%s.", matched)
+    return {"ok": True}
 
 
 @app.get("/books")
